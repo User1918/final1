@@ -36,7 +36,7 @@ float integral = 0;      // Integral accumulator
 unsigned long lastPIDCalculationTime = 0; // Timestamp of the last PID calculation
 
 // --- Timer for Stop Detection ---
-const int STOP_CHECK_INTERVAL_US = 100000; // Check every 100ms (0.1 seconds) if motor stopped
+const int STOP_CHECK_INTERVAL_US = 1000000; // Check every 100ms (0.1 seconds) if motor stopped
 volatile unsigned long lastCheckedPulseCount = 0; // Pulse count at the last timer check
 
 // --- PID Calculation Interval ---
