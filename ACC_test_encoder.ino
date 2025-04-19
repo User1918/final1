@@ -1,96 +1,112 @@
 #include <Arduino.h>
 #include <math.h>
 #include "esp_timer.h" // For ESP32 specific timer
+// #include <string.h> // Not needed for this version
 
-// --- Pin Definitions --- (Keep these as they are)
+// --- Pin Definitions ---
 #define RPWM 2
 #define LPWM 15
 #define R_EN 0
 #define L_EN 4
 #define IS_R 25
 #define IS_L 26
-#define SERVO_PIN 13         // Keep servo pin if needed
+// #define SERVO_PIN 13 // Servo pin commented out
 #define HALL_SENSOR_PIN 12
 
-// --- Servo Constants --- (Keep these if servo is still used)
-#define MIN_PULSE_WIDTH 500
-#define MAX_PULSE_WIDTH 2500
-#define REFRESH_INTERVAL 20000
-#define SERVO_MIN_ANGLE 40
-#define SERVO_MAX_ANGLE 130
+// --- Servo Constants --- (Optional - commented out)
+// #define MIN_PULSE_WIDTH 500
+// #define MAX_PULSE_WIDTH 2500
+// #define REFRESH_INTERVAL 20000 // 50Hz
+// #define SERVO_MIN_ANGLE 40
+// #define SERVO_MAX_ANGLE 130
 
-// --- Motor & Driver Constants --- (Keep these, calibrate CURRENT_LIMIT_MV)
+// --- Motor & Driver Constants ---
+// !!! MUST CALIBRATE CURRENT_LIMIT_MV FOR YOUR BTS7960 BOARD !!!
 #define CURRENT_LIMIT_MV 7000 // Example: Needs calibration!
 
-// --- Encoder / RPM Calculation --- (Keep these)
+// --- Encoder / RPM Calculation ---
 const int PULSES_PER_REV = 5;
-volatile unsigned long pulseCount = 0;
-volatile float currentRPM = 0.0;        // Measured RPM
-const unsigned long RPM_CALC_INTERVAL_MS = 50;
+volatile unsigned long pulseCount = 0; // DEFINED ONCE
+volatile float currentRPM = 0.0;       // Measured RPM from encoder
+const unsigned long RPM_CALC_INTERVAL_MS = 50; // Update RPM calculation every 50ms
 const unsigned long RPM_CALC_INTERVAL_US = RPM_CALC_INTERVAL_MS * 1000;
 volatile unsigned long lastRpmCalcTime = 0;
 volatile unsigned long lastRpmCalcPulseCount = 0;
 esp_timer_handle_t rpm_timer_handle;
 
-// --- Stop Detection Timer --- (Keep this, optional but useful)
-const int STOP_CHECK_INTERVAL_US = 1000000;
+// --- Stop Detection Timer ---
+const int STOP_CHECK_INTERVAL_US = 1000000; // 1 second
 volatile unsigned long lastCheckedPulseCount = 0;
 bool motorRunning = false; // Flag set by setMotorPWM
 esp_timer_handle_t stop_timer_handle;
 
-// --- Serial Communication Buffer ---
-String serialDataIn = ""; // Buffer for incoming serial data
+// --- REMOVED Serial Communication Buffer ---
+// String serialDataIn = ""; // No longer needed
 
 // --- Global State Variables ---
-int commandedPWM = 0;       // The PWM value received via Serial (0-255)
-int32_t steering_angle = 90; // Keep steering angle if needed
+int commandedPWM = 0;        // The PWM value SET IN SETUP() to apply
+// int32_t steering_angle = 90; // Optional: Keep steering angle if needed (Commented out)
+
+// --- REMOVED Variables ---
+// float RPM_setpoint = 0.0; // No RPM setpoint in this version
+// int32_t received_speed = 0; // No speed received
+// float integral = 0.0; // No PID
+// float previousErrorRPM = 0.0; // No PID
+// unsigned long lastPIDRunTime = 0; // No PID
+// int currentPWM = 0; // Renamed to commandedPWM or read directly
 
 // =========================================================================
-// INTERRUPT SERVICE ROUTINE (ISR) - Hall Sensor / Encoder (Keep as is)
+// INTERRUPT SERVICE ROUTINE (ISR) - Hall Sensor / Encoder
 // =========================================================================
 void IRAM_ATTR hallSensorISR() {
     pulseCount++;
 }
 
 // =========================================================================
-// TIMER CALLBACK - RPM Calculation (Keep as is)
+// TIMER CALLBACK - RPM Calculation
 // =========================================================================
 void IRAM_ATTR rpm_timer_callback(void *arg) {
-    // ... (Keep the existing code for rpm_timer_callback) ...
     unsigned long currentTime_us = micros();
     unsigned long currentPulseReading;
+
     noInterrupts();
     currentPulseReading = pulseCount;
     interrupts();
+
     unsigned long deltaTime_us = currentTime_us - lastRpmCalcTime;
     unsigned long deltaPulses = currentPulseReading - lastRpmCalcPulseCount;
+
     float calculatedRPM = 0.0;
     if (deltaTime_us > 0 && deltaPulses > 0) {
         float pulses_per_second = (float)deltaPulses * 1000000.0 / (float)deltaTime_us;
         float rps = pulses_per_second / (float)PULSES_PER_REV;
         calculatedRPM = rps * 60.0;
-    } else if (deltaTime_us > RPM_CALC_INTERVAL_US * 2) {
-         if (commandedPWM < 5) { // If commanded PWM is very low, allow forcing RPM to 0
+    } else if (deltaTime_us > RPM_CALC_INTERVAL_US * 2) { // If no pulses for a while
+         // Force RPM to 0 if commanded PWM is very low (motor should be stopped)
+         // Use the globally set commandedPWM here
+         if (commandedPWM < 5) { // Adjust threshold if needed
               calculatedRPM = 0.0;
          }
     }
+
     noInterrupts();
-    currentRPM = calculatedRPM;
+    currentRPM = calculatedRPM; // Update the global measured RPM
     interrupts();
+
     lastRpmCalcTime = currentTime_us;
     lastRpmCalcPulseCount = currentPulseReading;
 }
 
 // =========================================================================
-// TIMER CALLBACK - Stop Detection (Keep as is)
+// TIMER CALLBACK - Stop Detection
 // =========================================================================
 void IRAM_ATTR stop_timer_callback(void *arg) {
-   // ... (Keep the existing code for stop_timer_callback) ...
     unsigned long currentPulseReading;
     noInterrupts();
     currentPulseReading = pulseCount;
     interrupts();
-    // Force RPM to 0 if motor was running but pulses stopped
+
+    // Force RPM to 0 if motor was running but pulses stopped for 1 sec
     if (motorRunning && currentPulseReading == lastCheckedPulseCount) {
         noInterrupts();
         currentRPM = 0.0;
@@ -100,24 +116,21 @@ void IRAM_ATTR stop_timer_callback(void *arg) {
 }
 
 // =========================================================================
-// FUNCTION: setMotorPWM (Keep as is)
-// Applies the given PWM value (0-255) to the motor driver.
+// FUNCTION: setMotorPWM (Applies PWM to driver)
 // =========================================================================
 void setMotorPWM(int pwmValue) {
-   // ... (Keep the existing code for setMotorPWM, including current check) ...
-   // This function now directly controls the motor based on commandedPWM
     pwmValue = constrain(pwmValue, 0, 255);
-    // currentPWM = pwmValue; // Don't need this global anymore unless displayData uses it
 
     uint16_t raw_IS_R = analogRead(IS_R);
     float voltage_IS_R_mV = raw_IS_R * (3300.0 / 4095.0);
 
+    // Check current limit (NEEDS CALIBRATION)
     if (voltage_IS_R_mV < CURRENT_LIMIT_MV ) {
         digitalWrite(R_EN, HIGH);
         digitalWrite(L_EN, HIGH);
         analogWrite(LPWM, pwmValue);
         digitalWrite(RPWM, LOW);
-        motorRunning = (pwmValue > 5); // Consider motor running if PWM > threshold
+        motorRunning = (pwmValue > 5); // Motor considered running if PWM > ~0
     } else {
         Serial.println("!!! CURRENT LIMIT EXCEEDED !!!");
         digitalWrite(R_EN, LOW);
@@ -125,18 +138,17 @@ void setMotorPWM(int pwmValue) {
         analogWrite(LPWM, 0);
         digitalWrite(RPWM, LOW);
         motorRunning = false;
-        // No integral to reset anymore
+        // No integral to reset
     }
 }
 
 // =========================================================================
-// FUNCTION: control_servo (Keep as is, if needed)
+// FUNCTION: control_servo (Optional - Commented out)
 // =========================================================================
+/*
 void control_servo() {
-   // ... (Keep the existing code for control_servo, if using steering) ...
     static unsigned long lastServoUpdate = 0;
     unsigned long now = micros();
-
     if (now - lastServoUpdate >= REFRESH_INTERVAL) {
         lastServoUpdate = now;
         int constrainedAngle = constrain(steering_angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
@@ -146,111 +158,72 @@ void control_servo() {
         digitalWrite(SERVO_PIN, LOW);
     }
 }
+*/
 
 // =========================================================================
-// FUNCTION: parseSimpleCommand (NEW - handles simple PWM command)
-// Parses commands like "<pwm_value>" or "<pwm_value,angle>"
-// Updates global commandedPWM and steering_angle
+// FUNCTION: parseSimpleCommand (REMOVED - No longer needed)
 // =========================================================================
-void parseSimpleCommand(String data) {
-    data.trim(); // Remove potential whitespace
-    if (!data.startsWith("<") || !data.endsWith(">")) {
-        Serial.println("Invalid format: Missing < or >");
-        return;
-    }
-    // Remove < and >
-    data = data.substring(1, data.length() - 1);
-
-    // Check if there's a comma for angle data
-    int commaIndex = data.indexOf(',');
-
-    if (commaIndex != -1) {
-        // Format <pwm,angle>
-        String pwmStr = data.substring(0, commaIndex);
-        String angleStr = data.substring(commaIndex + 1);
-        int pwmVal = pwmStr.toInt();
-        int angleVal = angleStr.toInt();
-
-        // Validate PWM
-        if (pwmVal >= 0 && pwmVal <= 255) {
-            commandedPWM = pwmVal;
-            Serial.print("Received PWM: "); Serial.print(commandedPWM);
-        } else {
-            Serial.print("Invalid PWM value: "); Serial.println(pwmStr);
-        }
-        // Validate and set Angle (optional)
-        if (angleVal >= 0 && angleVal <= 180) { // Or your specific angle limits
-             steering_angle = angleVal;
-             Serial.print(" | Received Angle: "); Serial.println(steering_angle);
-        } else {
-             Serial.print(" | Invalid Angle value: "); Serial.println(angleStr);
-        }
-
-    } else {
-        // Format <pwm> - Only PWM value provided
-        int pwmVal = data.toInt();
-        if (pwmVal >= 0 && pwmVal <= 255) {
-            commandedPWM = pwmVal;
-            Serial.print("Received PWM: "); Serial.println(commandedPWM);
-        } else {
-            Serial.print("Invalid PWM value: "); Serial.println(data);
-        }
-    }
-}
-
+// void parseSimpleCommand(String data) { ... } // Function definition removed
 
 // =========================================================================
-// FUNCTION: displayData (MODIFIED)
-// Prints Commanded PWM and Measured RPM.
+// FUNCTION: displayData (Prints Commanded PWM and Measured RPM)
 // =========================================================================
 void displayData() {
     static unsigned long lastPrintTime = 0;
-    const unsigned long PRINT_INTERVAL_MS = 100; // Print data every 100ms
+    const unsigned long PRINT_INTERVAL_MS = 200; // Print data every 200ms for readability
 
     if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
         lastPrintTime = millis();
-
         float measuredRPM;
-        // Atomically read currentRPM
         noInterrupts();
-        measuredRPM = currentRPM;
+        measuredRPM = currentRPM; // Read the latest calculated RPM
         interrupts();
 
-        // Print values in a format suitable for Arduino Serial Plotter
-        Serial.print("CommandPWM:");
+        // Print values clearly labelled for data collection
+        // commandedPWM now shows the value set in setup()
+        Serial.print("SetPWM: ");
         Serial.print(commandedPWM);
-        Serial.print(","); // Comma separator for plotter
-        Serial.print("MeasuredRPM:");
+        Serial.print("\t MeasuredRPM: "); // Use tab for spacing
         Serial.println(measuredRPM);
+
+        // Optional: Use plotter format if preferred
+        // Serial.print("SetPWM:"); Serial.print(commandedPWM);
+        // Serial.print(",MeasuredRPM:"); Serial.println(measuredRPM);
     }
 }
 
-
 // =========================================================================
-// SETUP FUNCTION (Simplified)
+// SETUP FUNCTION
 // =========================================================================
 void setup() {
     Serial.begin(115200);
-    Serial.println("ESP32 Motor RPM Reader Initializing...");
-    Serial.println("Send PWM command like:  or <100,90>"); // Instructions
+    Serial.println("========================================");
+    Serial.println("ESP32 Motor Characterization Tool");
+    Serial.println("Purpose: Measure RPM for a FIXED PWM input.");
+    Serial.println("PWM value is set directly in the setup() function.");
+    // Serial.println("Send commands via Serial Monitor like:"); // Removed
+    // Serial.println("  <pwm_value>          (e.g., )"); // Removed
+    // Serial.println("  <pwm_value,angle>    (e.g., <150,90>)"); // Removed
+    Serial.println("========================================");
 
     // --- Pin Modes ---
-    pinMode(SERVO_PIN, OUTPUT);
-    digitalWrite(SERVO_PIN, LOW);
-    pinMode(RPWM, OUTPUT);
-    pinMode(LPWM, OUTPUT);
-    pinMode(R_EN, OUTPUT);
-    pinMode(L_EN, OUTPUT);
-    pinMode(IS_R, INPUT);
-    pinMode(IS_L, INPUT);
+    // pinMode(SERVO_PIN, OUTPUT); digitalWrite(SERVO_PIN, LOW); // Servo pin commented out
+    pinMode(RPWM, OUTPUT); pinMode(LPWM, OUTPUT);
+    pinMode(R_EN, OUTPUT); pinMode(L_EN, OUTPUT);
+    pinMode(IS_R, INPUT); pinMode(IS_L, INPUT);
     pinMode(HALL_SENSOR_PIN, INPUT_PULLUP);
 
     // --- Initial State ---
-    digitalWrite(R_EN, LOW); // Start disabled
-    digitalWrite(L_EN, LOW);
-    analogWrite(LPWM, 0);
-    digitalWrite(RPWM, LOW);
-    setMotorPWM(0); // Ensure motor is stopped
+    digitalWrite(R_EN, LOW); digitalWrite(L_EN, LOW);
+    analogWrite(LPWM, 0); digitalWrite(RPWM, LOW);
+    // setMotorPWM(0); // Set PWM below
+
+    // **********************************************************
+    // ***** SET YOUR DESIRED FIXED PWM VALUE HERE (0-255) ******
+    commandedPWM = 150; // <<< CHANGE THIS VALUE FOR TESTING <<<
+    // **********************************************************
+    Serial.print("Setting fixed PWM to: "); Serial.println(commandedPWM);
+
     Serial.println("Motor pins initialized.");
 
     // --- Attach Interrupt ---
@@ -265,7 +238,7 @@ void setup() {
     interrupts();
     Serial.println("State variables initialized.");
 
-    // --- Setup ESP32 Timers --- (Keep these for RPM reading)
+    // --- Setup ESP32 Timers ---
     esp_timer_create_args_t rpm_timer_args = { .callback = &rpm_timer_callback, .name = "rpm_calc"};
     esp_timer_create(&rpm_timer_args, &rpm_timer_handle);
     esp_timer_start_periodic(rpm_timer_handle, RPM_CALC_INTERVAL_US);
@@ -276,45 +249,32 @@ void setup() {
     esp_timer_start_periodic(stop_timer_handle, STOP_CHECK_INTERVAL_US);
     Serial.println("Stop detection timer started.");
 
-    Serial.println("Setup Complete. Waiting for commands...");
+    Serial.println("\nSetup Complete. Running motor at fixed PWM.");
 }
 
 // =========================================================================
-// MAIN LOOP (Simplified)
+// MAIN LOOP
 // =========================================================================
 void loop() {
-    // --- Process Incoming Serial Data ---
+    // --- Check for and Process Incoming Serial Commands ---
+    // REMOVED - No serial input processing in this version
+    /*
     while (Serial.available() > 0) {
-        char receivedChar = (char)Serial.read();
-        if (receivedChar == '<') {
-            serialDataIn = ""; // Start new message
-            serialDataIn += receivedChar; // Keep start character if needed, or omit
-        } else if (receivedChar == '>') {
-            if (serialDataIn.startsWith("<")) { // Make sure we started correctly
-                 serialDataIn += receivedChar; // Add end character
-                 parseSimpleCommand(serialDataIn); // Parse the complete message
-                 serialDataIn = ""; // Reset buffer
-            }
-        } else if (serialDataIn.startsWith("<") && serialDataIn.length() < 20) { // Prevent overflow, allow for <pwm,angle>
-            serialDataIn += receivedChar;
-        }
-         // Handle potential timeout or buffer clear if '>' not received? Optional.
+        // ... Serial handling code removed ...
     }
+    */
 
-    // --- Apply Commanded PWM ---
-    // Apply the latest commanded PWM value to the motor
-    // Could alternatively only call this when commandedPWM changes,
-    // but calling periodically is fine.
+    // --- Apply Commanded PWM to Motor ---
+    // Directly use the PWM value set in setup()
     setMotorPWM(commandedPWM);
 
-    // --- Servo Control --- (Keep if needed)
-    control_servo();
+    // --- Control Servo (Optional - Commented out) ---
+    // control_servo();
 
     // --- Display Data ---
-    displayData(); // Display data periodically
+    // Periodically print the fixed PWM and the measured RPM
+    displayData();
 
-    // No PID calculation needed in the loop anymore
-    // Add a small delay if loop runs too fast without PID checks,
-    // though timer callbacks and serial checks usually add enough delay.
-    // delay(1); // Optional small delay
+    // No PID calculations here
+    // delay(1); // Small delay can sometimes help stability if loop is too tight
 }
