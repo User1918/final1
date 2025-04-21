@@ -4,48 +4,91 @@
 #include <driver/pcnt.h> // *** NEW: Include for Pulse Counter ***
 
 // --- Pin Definitions ---
-// ... (keep existing motor/servo pins) ...
+#define RPWM 2
+#define LPWM 15
+#define R_EN 0
+#define L_EN 4
+#define IS_R 25      // Analog Input for Current Sense R
+#define IS_L 26      // Analog Input for Current Sense L (If used)
+#define SERVO_PIN 13
+#define HALL_SENSOR_PIN 12
 #define HB100_PIN   GPIO_NUM_14 // *** NEW: Choose an available GPIO for HB100 input ***
 
-// --- Hall Sensor / Encoder ---
-// ... (keep existing encoder definitions) ...
-const int hallSensorPin = 12; // Keep this if still used by interrupt method
+// --- Servo Constants ---
+#define MIN_PULSE_WIDTH 500
+#define MAX_PULSE_WIDTH 2500
+#define REFRESH_INTERVAL 20000 // Micros for ~50Hz
+#define SERVO_MIN_ANGLE 40
+#define SERVO_MAX_ANGLE 130
 
-// --- RPM Calculation via Timer ---
-// ... (keep existing RPM timer definitions) ...
+// --- Motor & Driver Constants ---
+// !!! NEEDS CALIBRATION for your specific BTS7960 module !!!
+// This represents the voltage (in mV) corresponding to your desired max current
+#define CURRENT_LIMIT_MV 7000 // Example: Needs calibration!
+
+// --- Encoder / RPM Calculation ---
+const int PULSES_PER_REV = 5; // Pulses per revolution of the motor/wheel
+volatile unsigned long pulseCount = 0;
+volatile float currentRPM = 0.0; // Raw calculated RPM
+const unsigned long RPM_CALC_INTERVAL_MS = 100; // How often RPM is calculated (ms) - adjusted for stability
+const unsigned long RPM_CALC_INTERVAL_US = RPM_CALC_INTERVAL_MS * 1000;
+volatile unsigned long lastRpmCalcTime = 0;
+volatile unsigned long lastRpmCalcPulseCount = 0;
+esp_timer_handle_t rpm_timer_handle;
+
+// --- EMA Filter for RPM ---
+const float EMA_ALPHA = 0.1; // Smoothing factor (0.0 < alpha <= 1.0). TUNE THIS. Lower = smoother but more lag.
+float g_filteredRPM = 0.0;   // Global variable to hold the latest filtered RPM result
 
 // --- HB100 Doppler Sensor ---
 #define PCNT_UNIT           PCNT_UNIT_0 // *** NEW: Choose a PCNT unit (0-7) ***
 #define HB100_WAVELENGTH    0.0285 // *** NEW: Approx. wavelength in meters for 10.525 GHz ***
-#define HB100_READ_INTERVAL_MS 200 // *** NEW: How often to calculate HB100 velocity (ms) ***
+#define HB100_READ_INTERVAL_MS 250 // *** NEW: How often to calculate HB100 velocity (ms) ***
 #define HB100_READ_INTERVAL_US (HB100_READ_INTERVAL_MS * 1000)
 volatile float hb100_velocity_kmh = 0.0; // *** NEW: Stores calculated velocity ***
 esp_timer_handle_t hb100_timer_handle;  // *** NEW: Timer for reading PCNT ***
 // PCNT filter value - helps debounce noisy signals (adjust 0-1023)
-#define PCNT_FILTER_VAL 100 // *** NEW: Example filter value ***
+#define PCNT_FILTER_VAL 50 // *** NEW: Example filter value (tune if needed) ***
 
-// --- Motor Control & Setpoint ---
-// ... (keep existing motor control definitions) ...
-// !!! SUGGESTION: Use the speed received from Pi5 as the setpoint? !!!
-// float RPM_setpoint = 0; // Keep if set manually, or assign from speed_motor later
 
-// --- PID Controller Coefficients ---
-// ... (keep existing PID definitions) ...
+// --- PID Controller ---
+float RPM_setpoint = 0.0; // Desired speed (RPM) - Updated by serial data
+
+// *** NEW PID GAINS - MUST BE RETUNED ***
+float Kp = 0.8;  // Example starting value - TUNE ME!
+float Ki = 0.4;  // Example starting value - TUNE ME!
+float Kd = 0.05; // Example starting value - TUNE ME!
 
 // --- PID Timing & State Variables ---
-// ... (keep existing PID variables) ...
+const unsigned long PID_INTERVAL_MS = 20; // How often PID runs (ms) - adjusted
+const float PID_SAMPLE_TIME_S = (float)PID_INTERVAL_MS / 1000.0;
+float integral = 0.0;
+float previousErrorRPM = 0.0;
+unsigned long lastPIDRunTime = 0;
+int currentPWM = 0; // Stores the last calculated PWM value
 
-// --- Timer for Stop Detection ---
-// ... (keep existing stop timer definitions) ...
+// *** NEW: RPM-to-PWM Transformation Constants - MUST BE TUNED ***
+const float RPM_TO_PWM_SLOPE = 0.06;  // Example: PWM units per RPM - TUNE ME!
+const float RPM_TO_PWM_OFFSET = 5.0; // Example: PWM needed just to start motion - TUNE ME!
+const float MAX_RPM_ESTIMATE = 4500; // Example: Estimated max RPM for anti-windup - TUNE ME!
 
-// --- Global variables from serial ---
-volatile int32_t steering_angle = 90; // Default center
-volatile int32_t speed_motor = 0;     // Received motor command (RPM?)
+// --- Stop Detection Timer ---
+const int STOP_CHECK_INTERVAL_US = 1000000; // 1 second
+volatile unsigned long lastCheckedPulseCount = 0;
+bool motorRunning = false; // Updated in setMotorPWM
+esp_timer_handle_t stop_timer_handle;
 
+// --- Serial Communication Buffer ---
+const int SERIAL_BUFFER_SIZE = 10;
+byte serialBuffer[SERIAL_BUFFER_SIZE];
+int serialBufferIndex = 0;
+
+// --- Global State Variables ---
+volatile int32_t steering_angle = 90; // Updated by serial data
+volatile int32_t received_speed = 0; // Updated by serial data (used to set RPM_setpoint)
 
 // =========================================================================
 // INTERRUPT SERVICE ROUTINE (ISR) - Hall Sensor / Encoder
-// (Keep this if you still need the interrupt method for the encoder)
 // =========================================================================
 void IRAM_ATTR hallSensorISR() {
     pulseCount++;
@@ -65,21 +108,20 @@ void hb100_pcnt_init() {
         .neg_mode = PCNT_COUNT_DIS,    // Don't count falling edges
         .lctrl_mode = PCNT_MODE_KEEP,  // Keep default control modes
         .hctrl_mode = PCNT_MODE_KEEP,
-        // Set limits? Not strictly necessary if we clear periodically
-        // .counter_h_lim = INT16_MAX,
-        // .counter_l_lim = INT16_MIN,
+        // Set limits? Optional, can use for overflow detection if needed
+         .counter_h_lim = INT16_MAX, // Example limit
+         .counter_l_lim = INT16_MIN, // Example limit
     };
     pcnt_unit_config(&pcnt_config);
 
     // Configure PCNT filter (optional, but recommended)
-    if (PCNT_FILTER_VAL > 0) {
+    if (PCNT_FILTER_VAL > 0 && PCNT_FILTER_VAL <= 1023) {
         pcnt_set_filter_value(PCNT_UNIT, PCNT_FILTER_VAL);
         pcnt_filter_enable(PCNT_UNIT);
         Serial.printf("PCNT Filter enabled with value %d\n", PCNT_FILTER_VAL);
     } else {
         pcnt_filter_disable(PCNT_UNIT);
     }
-
 
     // Initialize PCNT's counter
     pcnt_counter_pause(PCNT_UNIT);
@@ -88,116 +130,17 @@ void hb100_pcnt_init() {
     Serial.println("HB100 PCNT Initialized.");
 }
 
-// =========================================================================
-// FUNCTION: setMotorPWM
-// !!! ATTENTION: Corrected current calculation and PWM variable usage !!!
-// =========================================================================
-void setMotorPWM(int targetPWM) { // Changed argument name for clarity
-    // --- Read Current Sensors ---
-    // Read raw ADC values
-    int raw_IS_R = analogRead(IS_R);
-    int raw_IS_L = analogRead(IS_L);
-
-    // --- Convert ADC to Millivolts ---
-    // Use floating point for accuracy!
-    float voltage_IS_R = raw_IS_R * (3300.0 / 4095.0);
-    float voltage_IS_L = raw_IS_L * (3300.0 / 4095.0);
-
-    // --- Convert Voltage to Milliamps (NEEDS CALIBRATION / DATASHEET) ---
-    // This is an EXAMPLE for BTS7960, check YOUR board's datasheet!
-    // BTS7960 formula might be: I_mA = (voltage_IS_mV / 8.5) for R_IS=1k
-    // Or I_load = V_IS * (I_is_norm / V_is_norm) = V_IS * (8500 A / 1 V) -> mA = mV * 8.5? Check!
-    // Placeholder - replace with your actual conversion factor K_IS (mA/mV)
-    float K_IS = 8.5; // Example mA/mV - ** FIND THE CORRECT VALUE **
-    float currentR_mA = voltage_IS_R * K_IS;
-    float currentL_mA = voltage_IS_L * K_IS;
-
-    // --- Current Limit Check and Motor Control ---
-    if (currentR_mA < CURRENT_LIMIT && currentL_mA < CURRENT_LIMIT) {
-        digitalWrite(R_EN, HIGH);
-        digitalWrite(L_EN, HIGH);
-        // Assuming forward direction only for simplicity
-        analogWrite(LPWM, targetPWM); // Use the passed PWM value
-        analogWrite(RPWM, 0);
-        motorRunning = (targetPWM > 0); // Update motor running status
-    } else {
-        // Overcurrent detected! Stop the motor.
-        digitalWrite(R_EN, LOW);
-        digitalWrite(L_EN, LOW);
-        analogWrite(LPWM, 0);
-        analogWrite(RPWM, 0);
-        motorRunning = false;
-        // Optional: Print a warning
-        // Serial.println("!!! OVERCURRENT DETECTED !!!");
-    }
-}
-
-// =========================================================================
-// Receive Function from pi5
-// (Corrected to match buffer size and casting)
-// =========================================================================
-void receiveData() {
-    static uint8_t buffer[10];
-    static int index = 0;
-
-    while (Serial.available()) {
-        uint8_t byteRead = Serial.read();
-
-        // Look for start character '<' only at the beginning
-        if (index == 0) {
-            if (byteRead == '<') {
-                buffer[index++] = byteRead;
-            } else {
-                // Ignore bytes until start character is found
-            }
-        } else {
-            // Store subsequent bytes
-            buffer[index++] = byteRead;
-
-            // Check if buffer is full (received 10 bytes)
-            if (index == 10) {
-                // Check for end character '>'
-                if (buffer[9] == '>') {
-                    // Extract data (assuming little-endian)
-                    int32_t received_angle = *((int32_t*)&buffer[1]);
-                    int32_t received_speed = *((int32_t*)&buffer[5]);
-
-                    // Update global volatile variables safely
-                    // (Direct assignment is usually atomic for int32_t on ESP32)
-                    steering_angle = received_angle;
-                    speed_motor = received_speed; // This is likely intended as RPM setpoint
-
-                    // Optional: Print received values for debugging
-                    // Serial.printf("Received Angle: %d, Speed: %d\n", steering_angle, speed_motor);
-
-                } else {
-                    // End character mismatch, invalid packet
-                     Serial.println("Invalid end char");
-                }
-                // Reset index regardless of end character match to start looking for next packet
-                index = 0;
-            }
-        }
-         // Prevent buffer overflow if start char found but end char never comes
-        if (index >= 10) {
-            index = 0;
-             Serial.println("Buffer overflow/reset");
-        }
-    }
-}
-
 
 // =========================================================================
 // TIMER CALLBACK - RPM Calculation
-// (No changes needed here)
 // =========================================================================
-void rpm_timer_callback(void *arg) {
-    // ... (keep existing code) ...
-     unsigned long currentTime_us = micros();
+void IRAM_ATTR rpm_timer_callback(void *arg) {
+    unsigned long currentTime_us = micros();
     unsigned long currentPulseReading;
 
-    // Temporarily disable interrupts to safely read pulseCount
-    // Consider if this is truly needed or if atomic read is sufficient
+    // Atomically read pulseCount
+    // Using noInterrupts() is safest, but potentially adds slight latency.
+    // Direct volatile read might be okay if acceptable for your accuracy needs.
     noInterrupts();
     currentPulseReading = pulseCount;
     interrupts();
@@ -206,88 +149,64 @@ void rpm_timer_callback(void *arg) {
     unsigned long deltaPulses = currentPulseReading - lastRpmCalcPulseCount;
 
     float calculatedRPM = 0.0;
-    // Prevent division by zero and ensure reasonable time has passed
-    if (deltaTime_us > 1000) { // e.g., require at least 1ms to avoid noise
+    // Calculate RPM only if time has passed and pulses were detected
+    if (deltaTime_us > 1000 && deltaPulses > 0) { // Min 1ms interval, ensure pulses counted
         float pulses_per_second = (float)deltaPulses * 1000000.0 / (float)deltaTime_us;
         float rps = pulses_per_second / (float)PULSES_PER_REV;
         calculatedRPM = rps * 60.0;
     }
+    // Consider adding logic here: If deltaPulses is 0 but setpoint > 0 for a while,
+    // perhaps calculatedRPM should decay towards 0 or use last known good value?
+    // Currently, if deltaPulses is 0, calculatedRPM remains 0 from initialization.
 
-    // Safely update global volatile variable
+    // Atomically update global currentRPM
     noInterrupts();
     currentRPM = calculatedRPM;
     interrupts();
 
-    // Update state for next calculation
+    // Store values for next calculation
     lastRpmCalcTime = currentTime_us;
     lastRpmCalcPulseCount = currentPulseReading;
 }
 
 // =========================================================================
-// FUNCTION: calculatePID
-// (No changes needed here, assuming RPM_setpoint is updated elsewhere)
-// =========================================================================
-int calculatePID(float currentSetpoint_rpm, float currentMeasurement_rpm) { // Changed arg names
-    // --- Calculate Error (in RPM) ---
-    // Consider if error transformation is needed if input/output are RPM now
-    float rpm_error = currentSetpoint_rpm - currentMeasurement_rpm;
-
-    // --- Integral Term ---
-    integral += rpm_error * PID_SAMPLE_TIME_S;
-    // Optional: Add Anti-windup
-
-    // --- Derivative Term ---
-    float derivative = 0;
-    if (PID_SAMPLE_TIME_S > 0) {
-        derivative = (rpm_error - previousError) / PID_SAMPLE_TIME_S;
-    }
-
-    // --- PID Calculation ---
-    float pwmOutput = Kp * rpm_error + Ki * integral + Kd * derivative;
-
-    // --- Update State ---
-    previousError = rpm_error;
-
-    // --- Constrain and Return PWM ---
-    return constrain((int)round(pwmOutput), 0, 255); // Use round() for better conversion
-}
-
-
-// =========================================================================
 // TIMER CALLBACK - Stop Detection
-// (No changes needed here)
 // =========================================================================
-void stop_timer_callback(void *arg) {
-   // ... (keep existing code) ...
-     unsigned long currentPulseReading;
+void IRAM_ATTR stop_timer_callback(void *arg) {
+    unsigned long currentPulseReading;
 
     noInterrupts();
     currentPulseReading = pulseCount;
     interrupts();
 
+    // If the motor is flagged as running but pulses haven't changed in 1 sec
     if (motorRunning && currentPulseReading == lastCheckedPulseCount) {
-        // Motor commanded to run, but no pulses detected for STOP_CHECK_INTERVAL_US
         noInterrupts();
         currentRPM = 0.0; // Force measured RPM to zero
+        // Also potentially reset EMA filter state if desired
+        // g_filteredRPM = 0.0; // Reset filtered value too
+        // Or re-seed EMA next time: updateEMA(0.0); // depends on EMA function design
         interrupts();
-        // Serial.println("Motor stop detected!"); // Optional debug
+         // Serial.println("Stop detected!"); // Debug
     }
-    lastCheckedPulseCount = currentPulseReading;
+    lastCheckedPulseCount = currentPulseReading; // Update for next check
 }
 
 // =========================================================================
 // TIMER CALLBACK - HB100 Velocity Calculation
 // *** NEW: Reads PCNT and calculates velocity ***
 // =========================================================================
-void hb100_timer_callback(void *arg) {
+void IRAM_ATTR hb100_timer_callback(void *arg) {
     int16_t count = 0;
-    esp_err_t result = pcnt_get_counter_value(PCNT_UNIT, &count); // Read PCNT value
+    // Read PCNT value safely
+    esp_err_t result = pcnt_get_counter_value(PCNT_UNIT, &count);
 
     if (result == ESP_OK) {
-        pcnt_counter_clear(PCNT_UNIT); // Clear counter for the next interval
+        // Clear counter immediately after reading for the next interval
+        pcnt_counter_clear(PCNT_UNIT);
 
-        // Calculate frequency
-        float frequency = (float)count * (1000000.0 / HB100_READ_INTERVAL_US);
+        // Calculate frequency based on counts over the known interval
+        float frequency = (float)abs(count) * (1000000.0 / HB100_READ_INTERVAL_US); // Use abs(count) if neg_mode is used
 
         // Calculate velocity using Doppler formula (v = f * lambda / 2)
         float velocity_mps = (frequency * HB100_WAVELENGTH) / 2.0;
@@ -295,55 +214,217 @@ void hb100_timer_callback(void *arg) {
         // Convert m/s to km/h
         float velocity_kmh = velocity_mps * 3.6;
 
-        // Store result in volatile global variable
-        // (Direct assignment usually atomic for float on ESP32)
+        // Store result in volatile global variable (atomic write for float on ESP32)
         hb100_velocity_kmh = velocity_kmh;
 
     } else {
-        Serial.println("Error reading PCNT");
-        hb100_velocity_kmh = -1.0; // Indicate error
+        Serial.println("Error reading HB100 PCNT");
+        hb100_velocity_kmh = -1.0; // Indicate error condition
     }
 }
 
 
-//==========================================================================
-// STEERING FUNC
-// !!! ATTENTION: Using delayMicroseconds() blocks! Consider ESP32Servo library !!!
-//==========================================================================
+// =========================================================================
+// FUNCTION: setMotorPWM
+// Applies the given PWM value (0-255) to the motor driver.
+// Includes basic current check.
+// =========================================================================
+void setMotorPWM(int pwmValue) {
+    pwmValue = constrain(pwmValue, 0, 255);
+    currentPWM = pwmValue; // Store the value being applied for display/debug
+
+    // --- Basic Current Check (using voltage threshold) ---
+    // !!! THIS NEEDS CALIBRATION based on your driver's mV output at max desired Amps !!!
+    uint16_t raw_IS_R = analogRead(IS_R); // Only checking one side for simplicity here
+    float voltage_IS_R_mV = raw_IS_R * (3300.0 / 4095.0);
+
+    if (voltage_IS_R_mV < CURRENT_LIMIT_MV ) {
+        digitalWrite(R_EN, HIGH); // Assuming EN pins enable the driver
+        digitalWrite(L_EN, HIGH);
+        // Assuming forward direction: LPWM controls speed, RPWM is LOW
+        analogWrite(LPWM, pwmValue);
+        digitalWrite(RPWM, LOW); // Ensure other PWM is off for simple forward
+        motorRunning = (pwmValue > 10); // Update status (consider a small deadzone)
+    } else {
+        // Current limit exceeded! Stop the motor immediately
+        Serial.printf("!!! CURRENT LIMIT EXCEEDED (%.1f mV) !!!\n", voltage_IS_R_mV);
+        digitalWrite(R_EN, LOW);
+        digitalWrite(L_EN, LOW);
+        analogWrite(LPWM, 0);
+        digitalWrite(RPWM, LOW);
+        motorRunning = false;
+        integral = 0; // Reset PID integral term on fault
+        currentPWM = 0;
+    }
+}
+// =========================================================================
+// FUNCTION: updateEMA filter
+// =========================================================================
+float updateEMA(float currentRawValue) {
+    // Static variables retain value between calls, initialized once.
+    static float previousEMA = 0.0;
+    static bool initialized = false;
+
+    // Initialize the filter with the first non-zero reading
+    if (!initialized) {
+        if (abs(currentRawValue) > 0.01) { // Avoid initializing with transient zero
+             previousEMA = currentRawValue;
+             initialized = true;
+        }
+        // Return raw value until initialized to avoid returning 0 if first value is 0
+        return currentRawValue;
+    }
+
+    // Apply the EMA formula
+    float currentEMA = (EMA_ALPHA * currentRawValue) + ((1.0 - EMA_ALPHA) * previousEMA);
+
+    // Update the state for the next call
+    previousEMA = currentEMA;
+
+    return currentEMA;
+}
+// =========================================================================
+// FUNCTION: calculatePID_RPM_Output (NEW PID Logic)
+// =========================================================================
+float calculatePID_RPM_Output(float setpointRPM, float measuredRPM) {
+    // Calculate Error (in RPM)
+    float errorRPM = setpointRPM - measuredRPM;
+
+    // Integral Term (with anti-windup clamping)
+    float maxIntegralContribution_RPM = MAX_RPM_ESTIMATE * 1.1; // Allow integral to slightly exceed max RPM estimate
+    float maxIntegral = (abs(Ki) > 1e-6) ? maxIntegralContribution_RPM / Ki : 1e9; // Avoid division by zero
+
+    integral += errorRPM * PID_SAMPLE_TIME_S;
+    integral = constrain(integral, -abs(maxIntegral), abs(maxIntegral)); // Clamp integral
+
+    // Derivative Term
+    float derivative = 0;
+    if (PID_SAMPLE_TIME_S > 0) {
+        derivative = (errorRPM - previousErrorRPM) / PID_SAMPLE_TIME_S;
+    }
+
+    // PID Calculation (Output is RPM-based effort)
+    float p_term = Kp * errorRPM;
+    float i_term = Ki * integral;
+    float d_term = Kd * derivative;
+    float pidOutput_RPM = p_term + i_term + d_term;
+
+    // Update State for Next Iteration
+    previousErrorRPM = errorRPM;
+
+    // Basic anti-windup check based on output effort (optional addition)
+    // If pidOutput_RPM is already demanding > max RPM, maybe clamp integral more?
+    // (Clamping integral above is usually sufficient)
+
+    return pidOutput_RPM;
+}
+
+// =========================================================================
+// FUNCTION: transformRPMtoPWM (NEW Transformation Logic)
+// =========================================================================
+int transformRPMtoPWM(float targetEffort_RPM) {
+    // Apply linear transformation: PWM = m * RPM + c
+    float calculatedPWM_f = RPM_TO_PWM_SLOPE * targetEffort_RPM + RPM_TO_PWM_OFFSET;
+
+    // Add feedforward based on setpoint (optional, helps response)
+    // float feedforwardPWM = RPM_TO_PWM_SLOPE * RPM_setpoint + RPM_TO_PWM_OFFSET;
+    // calculatedPWM_f += feedforwardPWM; // If using feedforward
+
+    // Constrain the result to the valid PWM range
+    int pwmOut = constrain((int)round(calculatedPWM_f), 0, 255);
+
+    // Prevent applying tiny PWM values if setpoint is zero (helps stop cleanly)
+    if (abs(RPM_setpoint) < 0.1 && pwmOut < (int)round(RPM_TO_PWM_OFFSET)+5) { // Threshold check
+        pwmOut = 0;
+    }
+     // If setpoint is non-zero but calculated PWM is very low (below offset), maybe force minimum?
+    // else if (abs(RPM_setpoint) > 0.1 && pwmOut < (int)round(RPM_TO_PWM_OFFSET)) {
+    //    pwmOut = (int)round(RPM_TO_PWM_OFFSET); // Force minimum PWM to overcome stiction? Needs testing.
+    // }
+
+
+    return pwmOut;
+}
+
+// =========================================================================
+// FUNCTION: control_servo
+// Uses blocking delayMicroseconds - CONSIDER REPLACING with ESP32Servo library
+// =========================================================================
 void control_servo() {
-    int targetAngle = steering_angle; // Use the volatile global directly
+    static unsigned long lastServoUpdate = 0;
+    unsigned long now = micros(); // Use micros for servo timing
 
-    // Clamp angle
-    if (targetAngle < 40) targetAngle = 40;
-    if (targetAngle > 130) targetAngle = 130;
+    // Refresh servo periodically based on REFRESH_INTERVAL
+    if (now - lastServoUpdate >= REFRESH_INTERVAL) {
+        lastServoUpdate = now;
 
-    // --- Blocking Software PWM - Consider replacing ---
-    int pulseWidth = map(targetAngle, 0, 180, MIN_PULSE_WIDTH, MAX_PULSE_WIDTH);
-    digitalWrite(SERVO_PIN, HIGH);
-    delayMicroseconds(pulseWidth);
-    digitalWrite(SERVO_PIN, LOW);
-    // The second delay isn't strictly needed here if called frequently enough from loop
-    // delayMicroseconds(REFRESH_INTERVAL - pulseWidth);
-    // --- End Blocking Section ---
+        // Use volatile steering_angle directly, constrain it
+        int constrainedAngle = constrain(steering_angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
 
-    /* --- SUGGESTED REPLACEMENT using ESP32Servo library ---
-    #include <ESP32Servo.h>
-    Servo myServo; // Declare globally or in setup
+        // Map angle to pulse width
+        int pulseWidth = map(constrainedAngle, 0, 180, MIN_PULSE_WIDTH, MAX_PULSE_WIDTH);
 
-    void setup() {
-        // ... other setup ...
-        myServo.attach(SERVO_PIN);
-        // Optional: myServo.setPeriodHertz(50); // Standard 50Hz servo rate
+        // Generate pulse (BLOCKING)
+        digitalWrite(SERVO_PIN, HIGH);
+        delayMicroseconds(pulseWidth);
+        digitalWrite(SERVO_PIN, LOW);
     }
+}
 
-    void control_servo_non_blocking() {
-        int targetAngle = steering_angle;
-        if (targetAngle < 40) targetAngle = 40;
-        if (targetAngle > 130) targetAngle = 130;
-        myServo.write(targetAngle); // Let the library handle PWM
+// =========================================================================
+// FUNCTION: parseSerialData
+// Parses the fixed 10-byte packet: '<' angle(4) speed(4) '>'
+// Updates RPM_setpoint and steering_angle globals.
+// =========================================================================
+void parseSerialData() {
+    // Check start and end markers (already done partially in loop, defensive check)
+    if (serialBuffer[0] == '<' && serialBuffer[SERIAL_BUFFER_SIZE - 1] == '>') {
+        // Extract data assuming little-endian
+        int32_t received_angle_local = *((int32_t*)&serialBuffer[1]);
+        int32_t received_speed_local = *((int32_t*)&serialBuffer[5]);
+
+        // Update global volatile variables
+        // Direct assignment is generally atomic for int32_t on ESP32
+        steering_angle = received_angle_local;
+        received_speed = received_speed_local; // Store the raw received speed if needed elsewhere
+
+        // *** Set the PID setpoint based on received speed ***
+        RPM_setpoint = (float)received_speed_local;
+
+    } else {
+        Serial.println("Invalid serial packet format in parseSerialData.");
     }
-    // Call control_servo_non_blocking() in loop instead
-    */
+    // Reset buffer index externally after calling this function
+    // serialBufferIndex = 0; // Moved reset to the loop
+}
+
+// =========================================================================
+// FUNCTION: displayData (Modified to show more info)
+// =========================================================================
+void displayData() {
+    static unsigned long lastPrintTime = 0;
+    const unsigned long PRINT_INTERVAL_MS = 250; // Print every 250ms
+
+    if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
+        lastPrintTime = millis();
+
+        // Read volatile globals safely (direct reads usually ok for atomic types)
+        float rawRPM_display = currentRPM;
+        float filteredRPM_display = g_filteredRPM;
+        float setpoint_display = RPM_setpoint;
+        int pwm_display = currentPWM; // Read last applied PWM
+        float hb100_vel_display = hb100_velocity_kmh;
+        int steer_display = steering_angle;
+
+        // Print comma-separated values for easy plotting or parsing
+        Serial.printf("SP:%.1f,RAW:%.1f,FILT:%.1f,PWM:%d,HB100:%.2f,STEER:%d\n",
+                      setpoint_display,
+                      rawRPM_display,
+                      filteredRPM_display,
+                      pwm_display,
+                      hb100_vel_display,
+                      steer_display);
+    }
 }
 
 // =========================================================================
@@ -351,119 +432,129 @@ void control_servo() {
 // =========================================================================
 void setup() {
     Serial.begin(115200);
-    Serial.println("ESP32 Setup Starting...");
+    Serial.println("ESP32 Motor Control + HB100 Initializing...");
 
-    pinMode(SERVO_PIN, OUTPUT); // Keep for basic digitalWrite, needed even for ESP32Servo attach
-
-    // Motor pins
+    // --- Pin Modes ---
+    pinMode(SERVO_PIN, OUTPUT);
+    digitalWrite(SERVO_PIN, LOW); // Ensure servo pin is low initially
     pinMode(RPWM, OUTPUT);
     pinMode(LPWM, OUTPUT);
     pinMode(R_EN, OUTPUT);
     pinMode(L_EN, OUTPUT);
-    pinMode(IS_R, INPUT); // Analog input, no pinMode needed but doesn't hurt
-    pinMode(IS_L, INPUT); // Analog input
+    pinMode(IS_R, INPUT); // Analog input
+    // pinMode(IS_L, INPUT); // Only if using IS_L
+    pinMode(HALL_SENSOR_PIN, INPUT_PULLUP);
+    pinMode(HB100_PIN, INPUT); // *** NEW: Set HB100 pin as input ***
 
-    digitalWrite(R_EN, LOW); // Ensure motors are disabled initially
+    // --- Initial State ---
+    digitalWrite(R_EN, LOW); // Disable driver
     digitalWrite(L_EN, LOW);
-    analogWrite(LPWM, 0);
-    analogWrite(RPWM, 0);
+    analogWrite(LPWM, 0);    // Set PWM pins to 0
+    digitalWrite(RPWM, LOW);
+    setMotorPWM(0);          // Ensure motor state is off
 
-    // Encoder Interrupt Pin (if still using interrupt method)
-    pinMode(hallSensorPin, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(hallSensorPin), hallSensorISR, FALLING);
+    // --- Attach Encoder Interrupt ---
+    attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), hallSensorISR, FALLING);
+    Serial.println("Encoder ISR Attached.");
 
     // --- Initialize HB100 Pulse Counter ---
     hb100_pcnt_init(); // *** NEW ***
 
     // --- Initialize Timers & State ---
     lastRpmCalcTime = micros();
+    lastPIDRunTime = millis();
     noInterrupts(); // Minimize time interrupts are disabled
     lastRpmCalcPulseCount = pulseCount;
     lastCheckedPulseCount = pulseCount;
     interrupts();
+    Serial.println("State variables initialized.");
 
-    // RPM Timer Setup
-    esp_timer_create_args_t rpm_timer_args = { .callback = &rpm_timer_callback, .name = "rpm_calc"};
+    // --- Setup ESP32 Timers ---
+    // RPM Calculation Timer
+    esp_timer_create_args_t rpm_timer_args = { .callback = &rpm_timer_callback, .name = "rpm_calc", .dispatch_method = ESP_TIMER_ISR}; // Run callback from ISR context
     esp_timer_create(&rpm_timer_args, &rpm_timer_handle);
     esp_timer_start_periodic(rpm_timer_handle, RPM_CALC_INTERVAL_US);
     Serial.println("RPM Timer Started.");
 
-    // Stop Detection Timer Setup
-    esp_timer_create_args_t stop_timer_args = { .callback = &stop_timer_callback, .name = "motor_stop_check"};
+    // Stop Detection Timer
+    esp_timer_create_args_t stop_timer_args = { .callback = &stop_timer_callback, .name = "motor_stop_check", .dispatch_method = ESP_TIMER_ISR}; // Run callback from ISR context
     esp_timer_create(&stop_timer_args, &stop_timer_handle);
     esp_timer_start_periodic(stop_timer_handle, STOP_CHECK_INTERVAL_US);
     Serial.println("Stop Check Timer Started.");
 
-     // HB100 Read Timer Setup *** NEW ***
-    esp_timer_create_args_t hb100_timer_args = { .callback = &hb100_timer_callback, .name = "hb100_read"};
+    // HB100 Read Timer *** NEW ***
+    esp_timer_create_args_t hb100_timer_args = { .callback = &hb100_timer_callback, .name = "hb100_read", .dispatch_method = ESP_TIMER_ISR}; // Run callback from ISR context
     esp_timer_create(&hb100_timer_args, &hb100_timer_handle);
     esp_timer_start_periodic(hb100_timer_handle, HB100_READ_INTERVAL_US);
     Serial.println("HB100 Read Timer Started.");
 
-    Serial.println("Setup Complete.");
+    Serial.println("Setup Complete. Waiting for serial data...");
 }
 
 // =========================================================================
 // MAIN LOOP
 // =========================================================================
 void loop() {
+    // --- Process Incoming Serial Data ---
+    // Non-blocking read into buffer
+    while (Serial.available() > 0 && serialBufferIndex < SERIAL_BUFFER_SIZE) {
+        uint8_t byteRead = Serial.read();
+        // Handle start marker condition
+        if (serialBufferIndex == 0 && byteRead != '<') {
+            continue; // Discard bytes until start marker
+        }
+        serialBuffer[serialBufferIndex++] = byteRead;
+
+        // Check if full packet received
+        if (serialBufferIndex == SERIAL_BUFFER_SIZE) {
+            parseSerialData(); // Process the buffer, updates RPM_setpoint/steering_angle
+            serialBufferIndex = 0; // Reset for next packet
+        }
+    }
+    // Handle incomplete packet timeout? (Optional)
+
+
+    // --- Get Filtered RPM ---
+    // Get the latest raw RPM calculated by the timer callback
+    float rawRPM;
+    noInterrupts(); // Safely read volatile variable updated by timer ISR
+    rawRPM = currentRPM;
+    interrupts();
+    // Update the global filtered RPM value using the EMA function
+    g_filteredRPM = updateEMA(rawRPM); // Use the filtered value for PID
+
+
+    // --- PID Control Loop (Runs periodically) ---
     unsigned long currentMillis = millis();
-
-    // 1. Receive data from Pi5 (non-blocking)
-    receiveData();
-
-    // 2. Control Servo (Consider non-blocking version)
-    control_servo(); // Call the servo control function
-
-    // 3. Run PID Controller periodically
     if (currentMillis - lastPIDRunTime >= PID_INTERVAL_MS) {
         lastPIDRunTime = currentMillis; // Update time of this PID run
 
-        // --- Get current speed measurement ---
-        float measuredRPM;
-        // Reading volatile float is usually atomic, maybe skip noInterrupts here?
-        // noInterrupts();
-        measuredRPM = currentRPM;
-        // interrupts();
+        // Reset integral if setpoint is zero
+        if (abs(RPM_setpoint) < 0.1) {
+            integral = 0.0;
+            previousErrorRPM = 0.0; // Reset previous error as well
+        }
 
-        // --- Use received speed as setpoint (or keep manual RPM_setpoint) ---
-        // !!! ASSUMPTION: speed_motor from Pi5 is the desired RPM !!!
-        float current_rpm_setpoint = (float)speed_motor;
+        // Calculate desired control effort using PID (using filtered RPM)
+        float targetEffort_RPM = calculatePID_RPM_Output(RPM_setpoint, g_filteredRPM); // Use filtered RPM
 
-        // --- Calculate PID output ---
-        int targetPWM = calculatePID(current_rpm_setpoint, measuredRPM);
+        // Transform the RPM-based effort into a PWM value
+        int targetPWM = transformRPMtoPWM(targetEffort_RPM);
 
-        // --- Apply PWM to motor ---
-        setMotorPWM(targetPWM); // Pass the calculated PWM
-    }
+        // Apply the calculated PWM to the motor (includes current check)
+        setMotorPWM(targetPWM);
+    } // --- End of PID Control Loop ---
 
-    // 4. Display Data periodically (non-blocking)
-    displayData();
 
-    // Optional: Small delay to prevent loop from running too fast if nothing else happens
-    // delay(1); // Use with caution, can affect timing if too long
-}
+    // --- Servo Control ---
+    // Call non-blocking servo control frequently
+    control_servo(); // Still uses blocking delay! Replace if possible.
 
-// =========================================================================
-// FUNCTION: displayData
-// (Corrected to show target PWM, added HB100 velocity)
-// =========================================================================
-void displayData() {
-    static unsigned long lastPrintTime = 0;
-    const unsigned long PRINT_INTERVAL_MS = 200; // Print every 200ms
 
-    if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
-        lastPrintTime = millis();
+    // --- Display Data ---
+    displayData(); // Print data periodically
 
-        // Read volatile globals safely (usually atomic reads for float/long on ESP32)
-        float measuredRPM = currentRPM;
-        float targetRPM = (float)speed_motor; // Assuming speed_motor is the target
-        float current_hb100_vel = hb100_velocity_kmh;
 
-        Serial.printf("Target RPM: %.2f | Measured RPM: %.2f | HB100 Vel (km/h): %.2f | Steer: %d\n",
-                      targetRPM,
-                      measuredRPM,
-                      current_hb100_vel,
-                      steering_angle); // steering_angle is volatile, read directly
-    }
+    // Yield for other tasks (important if using FreeRTOS features implicitly)
+    // delay(1); // Use delay(0) or vTaskDelay(1) if needed, avoid long delays
 }
