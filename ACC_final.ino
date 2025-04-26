@@ -3,85 +3,119 @@
 #include "esp_timer.h" // For ESP32 specific timer
 
 // --- Pin Definitions ---
-#define RPWM 2       // Motor Right PWM
-#define LPWM 15      // Motor Left PWM
-#define R_EN 0       // Motor Right Enable
-#define L_EN 4       // Motor Left Enable
-#define IS_R 25      // Motor Right Current Sense
-#define IS_L 26      // Motor Left Current Sense
+#define RPWM 2
+#define LPWM 15
+#define R_EN 0
+#define L_EN 4
+#define IS_R 25 // Current Sense Right (assuming connected to right motor logic)
+#define IS_L 26 // Current Sense Left (unused in current logic, but defined)
+#define SERVO_PIN 13
+#define HALL_SENSOR_PIN 12
 
-#define SERVO_PIN 13 // Steering Servo Pin
+// --- Ultrasonic Pin Definitions ---
+#define echoPin 17 // Must be interrupt-capable
+#define trigPin 16
 
-#define HALL_SENSOR_PIN 12 // Encoder Input Pin
+// --- Ultrasonic Constants ---
+// Speed of sound ~343 m/s = 0.0343 cm/us. Factor = (speed cm/us) / 2
+#define SOUND_SPEED_FACTOR (0.01715f)
+const unsigned long TRIGGER_PULSE_DURATION_US = 10;      // Standard HC-SR04 trigger pulse width
+const unsigned long MIN_MEASUREMENT_INTERVAL_US = 60000; // Min 60ms between sensor triggers recommended
+const unsigned long MAX_ECHO_DURATION_US = 30000;        // Max duration to consider valid (relates to max range / timeout)
 
 // --- Servo Constants ---
-#define MIN_PULSE_WIDTH 500  // Minimum pulse width for servo (microseconds)
-#define MAX_PULSE_WIDTH 2500 // Maximum pulse width for servo (microseconds)
-#define REFRESH_INTERVAL 20000 // Servo refresh interval (microseconds, 50Hz) - Adjusted from original
-#define SERVO_MIN_ANGLE 40   // Minimum allowed steering angle
-#define SERVO_MAX_ANGLE 130  // Maximum allowed steering angle
+#define MIN_PULSE_WIDTH 500
+#define MAX_PULSE_WIDTH 2500
+#define REFRESH_INTERVAL 20000 // microseconds (for servo pulse generation)
+#define SERVO_MIN_ANGLE 40
+#define SERVO_MAX_ANGLE 130
 
 // --- Motor & Driver Constants ---
-#define CURRENT_LIMIT_MV 7000 // Example: Set a limit in mV corresponding to max current.
-                              // **IMPORTANT**: This value needs calibration based on your BTS7960 board's
-                              // IS pin output (V/A) and the desired current limit (mA).
-                              // The original '7000' seemed like mA, but the reading is analog voltage.
-                              // Assuming 100A max -> 7A continuous for BTS7960.
-                              // The IS pin might output e.g. 8.5mV/A or similar. Calibrate this!
+#define CURRENT_LIMIT_MV 7000 // Example: Needs calibration! Max voltage allowed from IS_R pin in mV
 
 // --- Encoder / RPM Calculation ---
-const int PULSES_PER_REV = 5;           // Pulses from Hall sensor per motor revolution
-volatile unsigned long pulseCount = 0;  // Incremented by ISR
-volatile float currentRPM = 0.0;        // Calculated RPM (updated by timer)
-const unsigned long RPM_CALC_INTERVAL_MS = 50; // How often RPM is calculated
+const int PULSES_PER_REV = 5;
+volatile unsigned long pulseCount = 0;
+volatile float currentRPM = 0.0; // Raw RPM calculated by timer
+const unsigned long RPM_CALC_INTERVAL_MS = 500;
 const unsigned long RPM_CALC_INTERVAL_US = RPM_CALC_INTERVAL_MS * 1000;
 volatile unsigned long lastRpmCalcTime = 0;
 volatile unsigned long lastRpmCalcPulseCount = 0;
 esp_timer_handle_t rpm_timer_handle;
 
-// --- PID Controller ---
-float RPM_setpoint = 0.0; // Desired speed (RPM), updated from Serial
-float Kp = 1.0;           // Proportional gain
-float Ki = 0.5;           // Integral gain
-float Kd = 0.01;          // Derivative gain
+// --- EMA Filter (for RPM smoothing) ---
+const float EMA_ALPHA = 0.05; // Smoothing factor (0.0 < alpha <= 1.0). TUNE THIS.
+float g_filteredRPM = 0.0;    // Global variable to hold the latest filtered RPM result
 
-// --- PID Timing & State Variables ---
-const unsigned long PID_INTERVAL_MS = 10;     // How often PID calculation runs
-const float PID_SAMPLE_TIME_S = (float)PID_INTERVAL_MS / 1000.0; // PID sample time in seconds
-float previousError = 0.0;
-float integral = 0.0;
-unsigned long lastPIDRunTime = 0; // For timing PID execution in loop()
-int currentPWM = 0; // Stores the last calculated PWM value
+// --- PID Controller (RPM based) ---
+float RPM_setpoint = 0.0; // Desired speed (RPM) - can be modified by serial or IDM
 
-// --- Linear Feedforward/Error Transformation Constants (Used inside PID) ---
-// These constants transform the error (RPM) before PID calculation.
-// Ensure they are tuned for RPM units if error is in RPM.
-// PWM = a * error_rpm + b  <- This is how they are used in calculatePID
-const float a = 80/339; // Example: Adjust scaling factor (Needs tuning)
-const float b = 180/113; // Example: Adjust offset (Needs tuning)
-                     // Original values: 80.0/339.0 and 180.0/113.0 might need re-evaluation.
+// PID Gains - MUST BE RETUNED for RPM control
+float Kp = 1.0;   // Example starting value - TUNE ME!
+float Ki = 0.5;   // Example starting value - TUNE ME!
+float Kd = 0.0;   // Example starting value - TUNE ME!
+// PID Timing & State Variables
+const unsigned long PID_INTERVAL_MS = 10; // How often PID loop runs
+const float PID_SAMPLE_TIME_S = (float)PID_INTERVAL_MS / 1000.0;
+float integral = 0.0;         // PID integral state
+float previousErrorRPM = 0.0; // Store previous error in RPM
+float previousMeasuredRPM = 0.0; // For derivative on measurement
+unsigned long lastPIDRunTime = 0;
+int currentPWM = 0;           // Stores the last calculated PWM value applied to motor
 
+// RPM-to-PWM Transformation Constants - MUST BE TUNED
+// PWM = RPM_TO_PWM_SLOPE * targetEffort_RPM + RPM_TO_PWM_OFFSET
+const float RPM_TO_PWM_SLOPE = 0.05;  // Example: PWM units per RPM - TUNE ME!
+const float RPM_TO_PWM_OFFSET = 4.6; // Example: PWM needed to overcome static friction - TUNE ME!
+const float MAX_RPM_ESTIMATE = 4000; // Example: Estimated max possible RPM for anti-windup - TUNE ME!
 
 // --- Stop Detection Timer ---
-const int STOP_CHECK_INTERVAL_US = 1000000; // Check every 1 second
+const int STOP_CHECK_INTERVAL_US = 1000000; // 1 second
 volatile unsigned long lastCheckedPulseCount = 0;
-bool motorRunning = false; // Flag to indicate if motor is intended to be running
+bool motorRunning = false; // Tracks if motor PWM > 0
 esp_timer_handle_t stop_timer_handle;
 
 // --- Serial Communication Buffer ---
-const int SERIAL_BUFFER_SIZE = 10; // < + 4 bytes angle + 4 bytes speed + >
+const int SERIAL_BUFFER_SIZE = 10; // Expecting <angle(4bytes)speed(4bytes)> = 10 bytes
 byte serialBuffer[SERIAL_BUFFER_SIZE];
 int serialBufferIndex = 0;
 
 // --- Global State Variables ---
-int32_t steering_angle = 90; // Desired steering angle (0-180, center likely 90), updated from Serial
-int32_t received_speed = 0;  // Temporary storage for speed received via Serial
+int32_t steering_angle = 90; // Desired servo angle (0-180 mapped)
+int32_t received_speed = 0;  // Target speed received via Serial (used as basis for RPM_setpoint)
+
+// --- Global variables for Ultrasonic ISR ---
+volatile unsigned long g_echoStartTimeUs = 0;
+volatile unsigned long g_echoEndTimeUs = 0;
+volatile float g_latestDistanceCm = -1.0;    // Stores the latest valid distance (-1 = no valid reading yet)
+volatile bool g_newReadingAvailable = false; // Flag set true by ISR when a reading is complete
+unsigned long g_lastTriggerTimeUs = 0;       // Tracks the time the last trigger was sent
 
 // =========================================================================
-// INTERRUPT SERVICE ROUTINE (ISR) - Hall Sensor / Encoder
+// INTERRUPT SERVICE ROUTINE (ISR) - Hall Sensor Encoder
 // =========================================================================
 void IRAM_ATTR hallSensorISR() {
     pulseCount++;
+}
+
+// =========================================================================
+// INTERRUPT SERVICE ROUTINE (ISR) - Ultrasonic Echo Pin
+// =========================================================================
+void IRAM_ATTR echoISR() {
+    unsigned long currentTimeUs = micros();
+    if (digitalRead(echoPin) == HIGH) {
+        g_echoStartTimeUs = currentTimeUs;
+        g_newReadingAvailable = false; // New measurement cycle started
+    } else {
+        g_echoEndTimeUs = currentTimeUs;
+        unsigned long durationUs = g_echoEndTimeUs - g_echoStartTimeUs;
+        // Validate duration
+        if (durationUs > 100 && durationUs < MAX_ECHO_DURATION_US) {
+            g_latestDistanceCm = (float)durationUs * SOUND_SPEED_FACTOR;
+            g_newReadingAvailable = true; // Valid reading complete
+        }
+        // If duration is out of range, do nothing, flag remains false
+    }
 }
 
 // =========================================================================
@@ -100,25 +134,28 @@ void IRAM_ATTR rpm_timer_callback(void *arg) {
     unsigned long deltaPulses = currentPulseReading - lastRpmCalcPulseCount;
 
     float calculatedRPM = 0.0;
-    if (deltaTime_us > 0 && deltaPulses > 0) { // Calculate only if time and pulses have changed
+    // Calculate only if time and pulses have changed significantly
+    if (deltaTime_us > RPM_CALC_INTERVAL_US / 2 && deltaPulses > 0) {
         float pulses_per_second = (float)deltaPulses * 1000000.0 / (float)deltaTime_us;
         float rps = pulses_per_second / (float)PULSES_PER_REV; // Revolutions per second
         calculatedRPM = rps * 60.0;                            // Revolutions per minute
-    } else if (deltaTime_us > RPM_CALC_INTERVAL_US * 2) { // If no pulses for a while, assume 0 RPM
-         // Check if motor *should* be running based on setpoint before forcing 0
-         if (abs(RPM_setpoint) < 0.1) { // Check if setpoint is effectively zero
-              calculatedRPM = 0.0;
-         }
-         // Otherwise, keep the last known RPM or let the stop timer handle it
+    } else if (deltaTime_us > RPM_CALC_INTERVAL_US * 2) { // If no pulses for ~2 intervals, check setpoint
+        // Check if motor *should* be running based on setpoint before forcing 0
+        if (abs(RPM_setpoint) < 0.1) { // Check if setpoint is effectively zero
+             calculatedRPM = 0.0;
+        }
+         // else: Keep last calculated RPM if setpoint is non-zero but no pulses detected recently
+    } else {
+         // Not enough time elapsed or no pulses, keep previous RPM
+         noInterrupts();
+         calculatedRPM = currentRPM; // Keep last value
+         interrupts();
     }
 
 
-    // Atomically update currentRPM
+    // Atomically update global currentRPM
     noInterrupts();
-    // Basic low-pass filter (optional, adjust alpha for more/less smoothing)
-    // float alpha = 0.8;
-    // currentRPM = alpha * currentRPM + (1.0 - alpha) * calculatedRPM;
-    currentRPM = calculatedRPM; // No filter for now
+    currentRPM = calculatedRPM;
     interrupts();
 
     // Store values for next calculation
@@ -126,10 +163,8 @@ void IRAM_ATTR rpm_timer_callback(void *arg) {
     lastRpmCalcPulseCount = currentPulseReading;
 }
 
-
 // =========================================================================
 // TIMER CALLBACK - Stop Detection
-// Checks if pulses have stopped accumulating when motor should be running
 // =========================================================================
 void IRAM_ATTR stop_timer_callback(void *arg) {
     unsigned long currentPulseReading;
@@ -138,208 +173,284 @@ void IRAM_ATTR stop_timer_callback(void *arg) {
     currentPulseReading = pulseCount;
     interrupts();
 
-    // If the motor is supposed to be running (setpoint > 0) but pulses haven't changed
+    // If the motor is supposed to be running (PWM > 0) but pulses haven't changed for STOP_CHECK_INTERVAL_US
     if (motorRunning && currentPulseReading == lastCheckedPulseCount) {
         noInterrupts();
-        currentRPM = 0.0; // Force measured RPM to zero
+        currentRPM = 0.0; // Force measured RPM to zero as it seems stalled
         interrupts();
-         // Optional: Could also trigger an error flag here
+        // Consider adding logic here to stop the motor or flag an error if stall is critical
     }
     lastCheckedPulseCount = currentPulseReading; // Update for next check
 }
 
 // =========================================================================
-// FUNCTION: setMotorPWM
-// Applies the given PWM value to the motor driver.
-// Includes basic current monitoring (NEEDS CALIBRATION).
-// Assumes positive PWM drives motor forward.
+// FUNCTION: setMotorPWM - Applies PWM and handles basic current limiting
 // =========================================================================
 void setMotorPWM(int pwmValue) {
     // Constrain PWM to valid range
     pwmValue = constrain(pwmValue, 0, 255);
-    currentPWM = pwmValue; // Store the value being applied
+    currentPWM = pwmValue; // Store the value being applied (for display/debug)
 
-    // --- Current Monitoring ---
-    // **WARNING:** This requires calibration! Read voltage from IS pins,
-    // convert it to current based on your BTS7960 board's specifics.
-    // The relationship is usually I = V_is / K, where K depends on sense resistor.
-    // For example, if K = 0.0085 V/A (8.5mV/A) and ADC is 12-bit (0-4095) on 3.3V ref:
-    // V_is = analogRead(IS_pin) * (3300.0 / 4095.0); // Voltage in mV
-    // Current_mA = V_is / 0.0085; // If K is 8.5mV/A = 0.0085 V/A
-
+    // --- Current Limiting Check ---
+    // Read voltage from current sense pin (assuming IS_R is relevant)
     uint16_t raw_IS_R = analogRead(IS_R);
-    uint16_t raw_IS_L = analogRead(IS_L); // Read L IS pin as well if used for braking/reverse
-
-    // Convert raw ADC reading to millivolts (assuming 3.3V ref, 12-bit ADC)
+    // Convert raw ADC value to millivolts (assuming 3.3V ref, 12-bit ADC)
     float voltage_IS_R_mV = raw_IS_R * (3300.0 / 4095.0);
-    // float voltage_IS_L_mV = raw_IS_L * (3300.0 / 4095.0); // If needed
 
-    // Placeholder for actual current check - using voltage directly for now
-    // Replace CURRENT_LIMIT_MV with a calibrated value.
-    if (voltage_IS_R_mV < CURRENT_LIMIT_MV /* && voltage_IS_L_mV < CURRENT_LIMIT_MV */) {
-        // Current is within limits, enable driver
-        digitalWrite(R_EN, HIGH);
-        digitalWrite(L_EN, HIGH); // Enable both for BTS7960
-
-        // Apply PWM (Forward direction assumed)
-        // To drive forward with BTS7960, typically:
-        // RPWM = PWM signal, LPWM = LOW (or vice versa depending on wiring)
-        analogWrite(LPWM, pwmValue); // Send PWM signal to Left PWM input
-        digitalWrite(RPWM, LOW);    // Keep Right PWM input LOW for forward
-
-        motorRunning = (pwmValue > 0); // Update motor running state
+    // Check against the defined limit
+    if (voltage_IS_R_mV < CURRENT_LIMIT_MV) {
+        // Current OK: Enable driver and set PWM
+        digitalWrite(R_EN, HIGH); // Enable Right channel (assuming affects LPWM/RPWM)
+        digitalWrite(L_EN, HIGH); // Enable Left channel (assuming affects LPWM/RPWM) - Adjust if only one enable needed
+        analogWrite(LPWM, pwmValue); // Set speed (assuming LPWM controls speed)
+        digitalWrite(RPWM, LOW);     // Set direction (assuming RPWM=LOW means forward)
+        motorRunning = (pwmValue > 0); // Update motor running state flag
     } else {
-        // Current limit exceeded! Stop the motor immediately
-        Serial.println("!!! CURRENT LIMIT EXCEEDED !!!");
-        digitalWrite(R_EN, LOW); // Disable driver
-        digitalWrite(L_EN, LOW); // Disable driver
-        analogWrite(LPWM, 0);    // Ensure PWM is off
-        digitalWrite(RPWM, LOW);
-        motorRunning = false;
-        integral = 0; // Reset integral term on fault
-        currentPWM = 0;
+        // CURRENT LIMIT EXCEEDED! Stop the motor immediately
+        Serial.print("!!! CURRENT LIMIT EXCEEDED (");
+        Serial.print(voltage_IS_R_mV);
+        Serial.println(" mV) !!!");
+
+        digitalWrite(R_EN, LOW);     // Disable driver
+        digitalWrite(L_EN, LOW);     // Disable driver
+        analogWrite(LPWM, 0);        // Set PWM to 0
+        digitalWrite(RPWM, LOW);     // Ensure direction pin is off
+        motorRunning = false;        // Update motor running state flag
+        integral = 0;                // Reset PID integral term on fault
+        currentPWM = 0;              // Reflect that applied PWM is now 0
+        RPM_setpoint = 0;            // Optionally stop trying to run
     }
 }
 
 // =========================================================================
-// FUNCTION: calculatePID
-// Calculates the required PWM using a FIXED sample time based on RPM error.
-// Includes the linear transformation `a*error + b` as per original code.
-// Returns the calculated PWM value (0-255).
+// FUNCTION: updateEMA - Exponential Moving Average Filter
 // =========================================================================
-int calculatePID(float setpointRPM, float measuredRPM) {
+float updateEMA(float currentRawValue) {
+    static float previousEMA = 0.0;
+    static bool initialized = false;
+
+    if (!initialized) {
+        // Initialize with the first non-zero reading if possible, or just the first reading
+        if (abs(currentRawValue) > 0.01) {
+           previousEMA = currentRawValue;
+           initialized = true;
+        } else {
+            // If starting at zero, wait for a non-zero value to initialize
+            return 0.0; // Return 0 until initialized with a real value
+        }
+    }
+
+    // Apply EMA formula
+    float currentEMA = (EMA_ALPHA * currentRawValue) + ((1.0 - EMA_ALPHA) * previousEMA);
+    previousEMA = currentEMA; // Update state for next call
+    return currentEMA;
+}
+
+
+// =========================================================================
+// FUNCTION: calculatePID_RPM_Output - PID calculation targeting RPM effort
+// Uses Derivative on Measurement to reduce setpoint kick
+// =========================================================================
+float calculatePID_RPM_Output(float setpointRPM, float measuredRPM) {
     // --- Calculate Error (in RPM) ---
     float errorRPM = setpointRPM - measuredRPM;
 
-    // --- Linear transformation (applied to error, as in original code) ---
-    // This step might need tuning or reconsideration based on desired behavior.
-    // It scales the error before it's used in the PID calculation.
-    float transformedError = a * errorRPM + b;
-    // Serial.print(" ErrorRPM: "); Serial.print(errorRPM); // Debug
-    // Serial.print(" TransformedError: "); Serial.print(transformedError); // Debug
+    // --- Integral Term (with anti-windup) ---
+    // Estimate max contribution needed from integral (e.g., enough to reach max RPM from offset)
+    // This needs tuning based on how much integral is needed to overcome load/friction.
+    float maxIntegralContribution_RPM = MAX_RPM_ESTIMATE * 0.5; // Example: Allow integral to contribute up to half the max RPM - TUNE ME!
+    float maxIntegral = (Ki > 0.001) ? maxIntegralContribution_RPM / Ki : 1e9; // Avoid division by zero
 
-    // --- Integral Term (using fixed sample time) ---
-    integral += transformedError * PID_SAMPLE_TIME_S;
+    // Accumulate integral error, applying basic anti-windup clamping
+    integral += errorRPM * PID_SAMPLE_TIME_S;
+    integral = constrain(integral, -maxIntegral, maxIntegral);
 
-    // --- Anti-windup (optional but recommended) ---
-    // Constrain the integral term to prevent excessive buildup
-    // float maxIntegral = 255.0 / Ki; // Example limit, adjust as needed
-    // integral = constrain(integral, -maxIntegral, maxIntegral);
-
-
-    // --- Derivative Term (using fixed sample time) ---
+    // --- Derivative Term (on Measurement) ---
     float derivative = 0;
-    // Check if sample time is valid (should always be true if > 0)
     if (PID_SAMPLE_TIME_S > 0) {
-        // Use change in transformed error for derivative calculation
-        derivative = (transformedError - previousError) / PID_SAMPLE_TIME_S;
+        derivative = (measuredRPM - previousMeasuredRPM) / PID_SAMPLE_TIME_S;
     }
 
-    // --- PID Calculation ---
-    // Calculates the total control output based on transformed error
-    float pidOutput = Kp * transformedError + Ki * integral + Kd * derivative;
-    // Serial.print(" P: "); Serial.print(Kp * transformedError); // Debug
-    // Serial.print(" I: "); Serial.print(Ki * integral); // Debug
-    // Serial.print(" D: "); Serial.print(Kd * derivative); // Debug
-    // Serial.print(" PID_Out: "); Serial.print(pidOutput); // Debug
-
+    // --- PID Calculation (Output is RPM-based effort) ---
+    float p_term = Kp * errorRPM;
+    float i_term = Ki * integral;
+    // Derivative on measurement is typically subtracted (assuming Kd is positive)
+    float d_term = Kd * derivative;
+    float pidOutput_RPM = p_term + i_term - d_term; // P + I - D(measurement)
 
     // --- Update State for Next Iteration ---
-    previousError = transformedError; // Store transformed error for next derivative calculation
+    previousErrorRPM = errorRPM;       // Store error for analysis/debug if needed
+    previousMeasuredRPM = measuredRPM; // Store current measurement for next derivative calculation
 
-    // --- Constrain and Return PWM ---
-    // The PID output is directly used as PWM signal strength
-    int pwmOut = constrain((int)round(pidOutput), 0, 255); // Round and constrain
-    // Serial.print(" PWM_Out: "); Serial.println(pwmOut); // Debug
+    // --- Return calculated effort (in RPM units) ---
+    return pidOutput_RPM;
+}
+
+// =========================================================================
+// FUNCTION: transformRPMtoPWM - Maps desired RPM effort to PWM value
+// =========================================================================
+int transformRPMtoPWM(float targetEffort_RPM) {
+    // Apply linear transformation: PWM = m * RPM + c
+    float calculatedPWM_f = RPM_TO_PWM_SLOPE * targetEffort_RPM + RPM_TO_PWM_OFFSET;
+
+    // Constrain the result to the valid PWM range [0, 255]
+    int pwmOut = constrain((int)round(calculatedPWM_f), 0, 255);
+
+    // If the target RPM is very close to zero, force PWM to zero
+    if (abs(targetEffort_RPM) < 0.1) { // Threshold might need tuning
+       pwmOut = 0;
+    }
+    // Ensure minimum PWM offset is applied only if target RPM is positive
+    // (avoids applying offset when trying to stop) - This is handled by the linear eq + constrain usually.
+
     return pwmOut;
 }
 
-
 // =========================================================================
-// FUNCTION: control_servo
-// Sends pulses to the servo based on the global `steering_angle`.
+// FUNCTION: control_servo - Sends pulse to servo based on steering_angle
 // =========================================================================
 void control_servo() {
     static unsigned long lastServoUpdate = 0;
     unsigned long now = micros();
 
-    // Refresh servo periodically to maintain position
+    // Refresh servo signal periodically
     if (now - lastServoUpdate >= REFRESH_INTERVAL) {
         lastServoUpdate = now;
 
-        // Constrain angle to safe limits
+        // Constrain angle to limits
         int constrainedAngle = constrain(steering_angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-
-        // Map angle (0-180 range assumed for mapping) to pulse width
+        // Map angle (0-180 reference) to servo pulse width (microseconds)
         int pulseWidth = map(constrainedAngle, 0, 180, MIN_PULSE_WIDTH, MAX_PULSE_WIDTH);
 
-        // Send the pulse
+        // Send pulse
         digitalWrite(SERVO_PIN, HIGH);
-        delayMicroseconds(pulseWidth); // Keep pin HIGH for calculated duration
+        delayMicroseconds(pulseWidth);
         digitalWrite(SERVO_PIN, LOW);
-        // No need for the second delayMicroseconds if using periodic updates
     }
-     // If not using ESP32Servo library, this manual pulsing needs to be done periodically.
-     // The REFRESH_INTERVAL handles this timing.
 }
 
-
 // =========================================================================
-// FUNCTION: parseSerialData
-// Processes bytes from the serial buffer to extract angle and speed.
-// Expected format: '<'[4-byte angle][4-byte speed]'>' (Total 10 bytes)
-// Updates global `steering_angle` and `received_speed`.
+// FUNCTION: parseSerialData - Extracts angle and speed from serial buffer
 // =========================================================================
 void parseSerialData() {
+    // Check for start '<' and end '>' markers
     if (serialBuffer[0] == '<' && serialBuffer[SERIAL_BUFFER_SIZE - 1] == '>') {
-        // Extract angle (bytes 1-4) - assumes little-endian from Pi
-        steering_angle = *((int32_t*)&serialBuffer[1]);
+        // Extract angle (bytes 1-4) and speed (bytes 5-8) assuming little-endian
+        memcpy(&steering_angle, &serialBuffer[1], sizeof(int32_t));
+        memcpy(&received_speed, &serialBuffer[5], sizeof(int32_t));
 
-        // Extract speed (bytes 5-8) - assumes little-endian from Pi
-        received_speed = *((int32_t*)&serialBuffer[5]);
+        // Use the received speed as the base target RPM (IDM might override this)
+        // RPM_setpoint = (float)received_speed; // Setpoint is now handled in loop based on IDM result
 
-        // Update the RPM setpoint with the received speed
-        // Add any scaling or unit conversion if needed (e.g., if Pi sends rad/s)
-        RPM_setpoint = (float)received_speed; // Assuming Pi sends desired RPM directly
+         //Serial.print("Received Angle: "); Serial.print(steering_angle);
+         //Serial.print(", Speed: "); Serial.println(received_speed);
 
-        // Serial.print("Received Angle: "); Serial.print(steering_angle);
-        // Serial.print(" | Received Speed (RPM): "); Serial.println(RPM_setpoint);
     } else {
         Serial.println("Invalid serial packet received.");
     }
-    // Reset buffer index for next packet
+    // Reset buffer index regardless of success or failure
     serialBufferIndex = 0;
 }
 
 // =========================================================================
-// FUNCTION: displayData
-// Prints Setpoint RPM and Measured RPM for plotting/debugging.
+// FUNCTION: displayData - Prints key variables to Serial Plotter format
 // =========================================================================
 void displayData() {
     static unsigned long lastPrintTime = 0;
-    const unsigned long PRINT_INTERVAL_MS = 100; // Print data every 100ms
+    const unsigned long PRINT_INTERVAL_MS = 200; // Print every 200ms
 
     if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
         lastPrintTime = millis();
 
-        float measuredRPM;
-        // Atomically read currentRPM
+        // Get raw RPM value atomically for display
+        float rawRPM_display;
         noInterrupts();
-        measuredRPM = currentRPM;
+        rawRPM_display = currentRPM;
         interrupts();
 
-        // Print values in a format suitable for Arduino Serial Plotter
+        // Format: SetpointRPM,RawRPM,FilteredRPM,AppliedPWM
         Serial.print("SetpointRPM:");
-        Serial.print(RPM_setpoint);
-        Serial.print(","); // Comma separator for plotter
-        Serial.print("MeasuredRPM:");
-        Serial.println(measuredRPM);
-
-        // Optional: Print other values for debugging
-        // Serial.print(" | PWM:"); Serial.print(currentPWM);
-        // Serial.print(" | Angle:"); Serial.print(steering_angle);
-        // Serial.println();
+        Serial.print(RPM_setpoint); // Current target RPM
+        Serial.print(",");
+        Serial.print("RawRPM:");
+        Serial.print(rawRPM_display, 2); // Raw calculated RPM
+        Serial.print(",");
+        Serial.print("FilteredRPM:");
+        Serial.print(g_filteredRPM, 2); // Smoothed RPM used by PID
+        Serial.print(",");
+        Serial.print("PWM:");
+        Serial.println(currentPWM); // Actual PWM applied
     }
+}
+
+// =========================================================================
+// FUNCTION: triggerUltrasonicMeasurement - Initiates ultrasonic ping
+// =========================================================================
+void triggerUltrasonicMeasurement() {
+    unsigned long currentTimeUs = micros();
+    // Check if enough time has passed since the last trigger
+    if (currentTimeUs - g_lastTriggerTimeUs >= MIN_MEASUREMENT_INTERVAL_US) {
+        g_newReadingAvailable = false; // Reset flag before triggering
+        digitalWrite(trigPin, LOW);
+        delayMicroseconds(2);
+        digitalWrite(trigPin, HIGH);
+        delayMicroseconds(TRIGGER_PULSE_DURATION_US);
+        digitalWrite(trigPin, LOW);
+        g_lastTriggerTimeUs = currentTimeUs; // Record trigger time
+    }
+}
+
+// =========================================================================
+// FUNCTION: getUltrasonicDistanceCm - Returns latest distance from ISR
+// =========================================================================
+float getUltrasonicDistanceCm() {
+    return g_latestDistanceCm; // Return value updated by echoISR
+}
+
+
+// =========================================================================
+// FUNCTION: calculateIDM - Intelligent Driver Model (Basic ACC)
+// Takes distance (cm), current speed (RPM), desired max speed (RPM)
+// Returns an adjusted target RPM based on distance.
+// NOTE: Assumes IDM constants are tuned for RPM units or uses speed conversion.
+//       Using direct RPM might require non-standard tuning.
+// =========================================================================
+float calculateIDM(float distance, float currentRPM, float desiredRPM) {
+    // IDM Constants - NEED TUNING (especially if using RPM directly)
+    // These might need adjustment based on whether speeds are RPM or converted linear speed.
+    const float a_max = 0.5;     // Max acceleration (RPM/s or linear equivalent) - TUNE
+    const float delta = 4.0;     // Acceleration exponent (usually 4)
+    const float s0 = 5.0;        // Min gap distance (cm) - TUNE
+    const float T_gap = 1.0;     // Desired time gap (s) - TUNE
+    const float b_comfort = 0.3; // Comfortable deceleration (RPM/s or linear equivalent) - TUNE
+
+    // Use local variables for calculation clarity
+    float v = currentRPM;            // Current speed
+    float v0 = max(0.1f, desiredRPM); // Desired speed (avoid division by zero)
+    float s = max(0.1f, distance);    // Current gap distance (avoid division by zero)
+
+    // Calculate desired minimum gap (s*) - Check units carefully!
+    // If v is RPM, v*T_gap is (rev/min)*s, v*v/(...) is (rev/min)*s. This is inconsistent with s0 (cm).
+    // --> Assumes the formula is adapted/tuned empirically for RPM, or conversion is needed.
+    // --> For this example, we proceed assuming empirical tuning for RPM was done.
+    float v_term = v * T_gap; // Units: RPM * s
+    float brake_term = (v * v) / (2.0 * sqrt(a_max * b_comfort)); // Units: RPM^2 / sqrt(RPM/s * RPM/s) -> RPM * s
+    // This formula assumes linear velocity units. Using RPM directly might not be physically accurate without scaling.
+    // Let's calculate s_star but be aware of the unit issue.
+    float s_star = s0 + max(0.0f, v_term + brake_term); // Ensure terms aren't negative
+
+    // Calculate acceleration command based on IDM formula
+    float accel_term = 1.0 - pow(v / v0, delta);
+    float gap_term = pow(s_star / s, 2.0);
+    float acceleration = a_max * (accel_term - gap_term);
+
+    // Calculate next target RPM using simple Euler integration
+    float nextRPM = v + acceleration * PID_SAMPLE_TIME_S; // PID sample time as dt
+
+    // Bound the result: cannot be negative, cannot exceed original desired speed
+    nextRPM = constrain(nextRPM, 0.0, desiredRPM);
+
+    return nextRPM;
 }
 
 
@@ -348,116 +459,158 @@ void displayData() {
 // =========================================================================
 void setup() {
     Serial.begin(115200);
-    Serial.println("ESP32 Motor Control Initializing...");
+    Serial.println("===== ESP32 Motor Control + IDM Initializing =====");
+    Serial.println("Build timestamp: " __DATE__ " " __TIME__); // Add build time
 
     // --- Pin Modes ---
     pinMode(SERVO_PIN, OUTPUT);
-    digitalWrite(SERVO_PIN, LOW); // Start servo pin low
-
+    digitalWrite(SERVO_PIN, LOW); // Ensure servo pin is low initially
     pinMode(RPWM, OUTPUT);
     pinMode(LPWM, OUTPUT);
     pinMode(R_EN, OUTPUT);
     pinMode(L_EN, OUTPUT);
     pinMode(IS_R, INPUT);
     pinMode(IS_L, INPUT);
+    pinMode(HALL_SENSOR_PIN, INPUT_PULLUP); // Use internal pullup for hall sensor
 
-    pinMode(HALL_SENSOR_PIN, INPUT_PULLUP); // Enable pull-up for Hall sensor
+    // Ultrasonic Pin Modes
+    pinMode(trigPin, OUTPUT);
+    pinMode(echoPin, INPUT);
+    digitalWrite(trigPin, LOW); // Ensure trigger starts low
 
-    // --- Initial State ---
-    digitalWrite(R_EN, LOW); // Start with motor driver disabled
-    digitalWrite(L_EN, LOW);
-    analogWrite(LPWM, 0);
-    digitalWrite(RPWM, LOW);
-    setMotorPWM(0); // Ensure motor is stopped initially
-    Serial.println("Motor pins initialized.");
+    // --- Initial Motor State ---
+    digitalWrite(R_EN, LOW); // Disable driver initially
+    digitalWrite(L_EN, LOW); // Disable driver initially
+    analogWrite(LPWM, 0);    // Set PWM to 0
+    digitalWrite(RPWM, LOW); // Set direction (e.g., LOW = forward)
+    setMotorPWM(0);          // Ensure motor is stopped using the function
 
-    // --- Attach Interrupt ---
-    attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), hallSensorISR, FALLING); // Or RISING/CHANGE depending on sensor
-    Serial.println("Hall sensor interrupt attached.");
+    // --- Attach Interrupts ---
+    attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), hallSensorISR, FALLING);
+    Serial.println("Hall Sensor ISR Attached.");
+    // Attach Ultrasonic Interrupt
+    attachInterrupt(digitalPinToInterrupt(echoPin), echoISR, CHANGE);
+    Serial.println("Ultrasonic Echo ISR Attached.");
 
     // --- Initialize Timers & State ---
     lastRpmCalcTime = micros();
     lastPIDRunTime = millis();
-    noInterrupts();
+    noInterrupts(); // Temporarily disable interrupts for atomic init
     lastRpmCalcPulseCount = pulseCount;
     lastCheckedPulseCount = pulseCount;
-    interrupts();
+    interrupts(); // Re-enable interrupts
     Serial.println("State variables initialized.");
 
     // --- Setup ESP32 Timers ---
     // RPM Calculation Timer
-    esp_timer_create_args_t rpm_timer_args = {
-        .callback = &rpm_timer_callback,
-        .name = "rpm_calc"
-    };
+    esp_timer_create_args_t rpm_timer_args = { .callback = &rpm_timer_callback, .name = "rpm_calc"};
     esp_timer_create(&rpm_timer_args, &rpm_timer_handle);
     esp_timer_start_periodic(rpm_timer_handle, RPM_CALC_INTERVAL_US);
-    Serial.println("RPM calculation timer started.");
+    Serial.println("RPM Calculation Timer Started.");
 
     // Stop Detection Timer
-    esp_timer_create_args_t stop_timer_args = {
-        .callback = &stop_timer_callback,
-        .name = "motor_stop_check"
-    };
+    esp_timer_create_args_t stop_timer_args = { .callback = &stop_timer_callback, .name = "motor_stop_check"};
     esp_timer_create(&stop_timer_args, &stop_timer_handle);
     esp_timer_start_periodic(stop_timer_handle, STOP_CHECK_INTERVAL_US);
-    Serial.println("Stop detection timer started.");
+    Serial.println("Motor Stop Check Timer Started.");
 
-    Serial.println("Setup Complete. Waiting for data...");
+    Serial.println("===== Setup Complete. Waiting for data... =====");
 }
 
 // =========================================================================
 // MAIN LOOP
 // =========================================================================
 void loop() {
-    // --- Process Incoming Serial Data ---
+    // --- 1. Process Incoming Serial Data ---
     while (Serial.available() > 0) {
         uint8_t byteRead = Serial.read();
-
+        // Look for start marker '<'
         if (serialBufferIndex == 0 && byteRead != '<') {
-            continue; // Wait for start marker
+            continue; // Ignore bytes until start marker
         }
-
+        // Fill buffer
         if (serialBufferIndex < SERIAL_BUFFER_SIZE) {
             serialBuffer[serialBufferIndex++] = byteRead;
         }
-
-        // If buffer full, check end marker and parse
+        // Check if buffer is full
         if (serialBufferIndex == SERIAL_BUFFER_SIZE) {
+            // Check for end marker '>' and parse
             if (serialBuffer[SERIAL_BUFFER_SIZE - 1] == '>') {
-                parseSerialData(); // Updates RPM_setpoint and steering_angle
+                parseSerialData(); // Updates steering_angle and received_speed
             } else {
-                // Invalid packet, reset index
-                serialBufferIndex = 0;
-                 Serial.println("Serial Frame Error: No end marker.");
+                Serial.println("Serial Frame Error: No end marker or incorrect size.");
+                serialBufferIndex = 0; // Reset index on error
             }
-             serialBufferIndex = 0; // Always reset index after processing or error
+            // Always reset index after attempting parse or on error if buffer full
+           // serialBufferIndex = 0; // This was inside parseSerialData, keep it there.
         }
+         // Handle buffer overflow? If index goes beyond size (shouldn't happen with check above)
+         if (serialBufferIndex >= SERIAL_BUFFER_SIZE) {
+             serialBufferIndex = 0; // Reset defensively
+         }
     }
 
-    // --- PID Control Loop (Runs periodically) ---
+    // --- 2. Ultrasonic Sensing & IDM ---
+    triggerUltrasonicMeasurement(); // Initiate ping if interval met
+    float currentDistance = getUltrasonicDistanceCm(); // Get latest distance from ISR
+
+    float base_target_rpm = (float)received_speed; // Start with speed from serial
+
+    // Apply IDM logic only if a valid distance reading is available
+    if (currentDistance >= 0) {
+        // Use IDM to adjust the RPM setpoint based on distance
+        if (currentDistance < 10) { // Emergency stop distance
+            RPM_setpoint = 0;
+             // Serial.printf("[IDM] STOP Condition! Dist: %.1f cm\n", currentDistance);
+        } else if (currentDistance <= 25) { // IDM active zone (Tune this upper limit)
+            RPM_setpoint = calculateIDM(currentDistance, g_filteredRPM, base_target_rpm);
+            // Serial.printf("[IDM] Active. Dist: %.1f cm, TargetRPM: %.2f\n", currentDistance, RPM_setpoint);
+        } else {
+            // Distance is large, use the base target speed
+            RPM_setpoint = base_target_rpm;
+            // Serial.printf("[IDM] Clear path. Dist: %.1f cm, TargetRPM: %.2f\n", currentDistance, RPM_setpoint);
+        }
+    } else {
+        // No valid distance reading yet (or sensor failed), use base target speed
+        RPM_setpoint = base_target_rpm;
+        // Serial.printf("[IDM] No valid distance reading. TargetRPM: %.2f\n", RPM_setpoint);
+    }
+
+    // --- 3. Get Filtered RPM ---
+    // Read raw RPM calculated by timer ISR
+    float rawRPM;
+    noInterrupts();
+    rawRPM = currentRPM;
+    interrupts();
+    // Apply EMA filter
+    g_filteredRPM = updateEMA(rawRPM);
+
+    // --- 4. PID Control Loop (Runs periodically) ---
     unsigned long currentMillis = millis();
     if (currentMillis - lastPIDRunTime >= PID_INTERVAL_MS) {
         lastPIDRunTime = currentMillis; // Update time of this PID run
 
-        // Get current speed measurement
-        float measuredRPM;
-        noInterrupts();
-        measuredRPM = currentRPM;
-        interrupts();
+        // Reset integral if setpoint is zero (helps prevent windup at stop)
+        if (abs(RPM_setpoint) < 0.1) {
+            integral = 0.0;
+            // previousErrorRPM = 0.0; // Already handled by pid calc if error is 0
+             previousMeasuredRPM = 0.0; // Assume speed is zero if setpoint is zero
+        }
 
-        // Calculate the target PWM using the PID function
-        int targetPWM = calculatePID(RPM_setpoint, measuredRPM);
+        // Calculate desired control effort in RPM units using PID
+        float targetEffort_RPM = calculatePID_RPM_Output(RPM_setpoint, g_filteredRPM);
 
-        // Apply the calculated PWM to the motor
+        // Transform the RPM-based effort into a PWM value
+        int targetPWM = transformRPMtoPWM(targetEffort_RPM);
+
+        // Apply the calculated PWM to the motor (includes current check)
         setMotorPWM(targetPWM);
     }
 
-    // --- Servo Control ---
-    // control_servo needs to be called frequently to maintain position
-    // if not using a servo library that handles background updates.
-    control_servo(); // Call this on every loop iteration
+    // --- 5. Servo Control ---
+    control_servo(); // Updates servo position based on steering_angle
 
-    // --- Display Data ---
-    displayData(); // Display data periodically for plotting/debugging
+    // --- 6. Display Data ---
+    displayData(); // Prints data to Serial Plotter periodically
 }
+// Removed extra closing brace that might have been here previously. End of code.
