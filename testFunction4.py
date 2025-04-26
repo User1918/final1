@@ -548,16 +548,6 @@ def main():
                      print("** Stop condition met (large sign)! Setting speed to 0. **")
                 final_speed_command_vel = 0
             final_speed_command_rpm = transform_speed(final_speed_command_vel)
-            # 6. Determine Final Commanded Speed (RPM)
-            # ... (Keep final speed command logic exactly as it was) ...
-            final_speed_command_vel = speed_motor_requested
-            final_speed_command_vel = min(final_speed_command_vel, current_speed_limit)
-            if stop_condition_met:
-                final_speed_command_vel = 0
-                if speed_motor_requested > 0:
-                     print("** Stop condition met! Setting speed to 0. **")
-            final_speed_command_rpm = transform_speed(final_speed_command_vel)
-
             # 7. PID Calculation for Steering
             steering = pid_controller.update(cte_f) # steering is the servo angle (0-180)
 
