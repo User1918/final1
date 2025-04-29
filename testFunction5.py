@@ -293,7 +293,7 @@ class PID:
 
         return steering_servo_angle
 
-# --- NCNN Detection Function ---
+# --- NCNN Detection Function ----
 def detect_signs_and_get_results(input_frame_bgr):
     """ Performs NCNN object detection. Returns list of detected object dictionaries. """
     global net, NCNN_INPUT_SIZE, NCNN_INPUT_NAME, NCNN_OUTPUT_NAME, NCNN_MEAN_VALS, NCNN_NORM_VALS
@@ -306,35 +306,20 @@ def detect_signs_and_get_results(input_frame_bgr):
     if original_height == 0 or original_width == 0: return detections_results
 
     try:
-        # Preprocessing: Resize with padding and normalize
+        # Preprocessing: Resize with padding and normalize (Same as before)
         target_size = NCNN_INPUT_SIZE
-        # Calculate scaling factor to fit within target size while maintaining aspect ratio
         scale = min(target_size / original_width, target_size / original_height)
         new_w, new_h = int(original_width * scale), int(original_height * scale)
-        # Calculate padding dimensions
         dw = (target_size - new_w) // 2
         dh = (target_size - new_h) // 2
-
-        # Create NCNN Mat from image, resizing and padding implicitly if supported,
-        # otherwise manually pad then create Mat. Let's try resize first.
-        # NOTE: ncnn python bindings for from_pixels_resize might handle padding differently
-        # depending on the version. Verify its behavior or use manual padding.
-
-        # Manual Padding approach:
-        padded_img = np.full((target_size, target_size, 3), 114, dtype=np.uint8) # Pad with gray
-        # Check if new dimensions are valid before slicing
+        padded_img = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
         if new_w > 0 and new_h > 0:
             resized_img = cv2.resize(input_frame_bgr, (new_w, new_h))
             padded_img[dh:dh+new_h, dw:dw+new_w, :] = resized_img
-        else: # Handle case where resize results in zero dimension
-             padded_img = input_frame_bgr # Or handle error appropriately
+        else:
+             padded_img = input_frame_bgr
              print("Warning: Resize resulted in zero dimension.")
-
-
-        # Create NCNN Mat from the padded image
         mat_in = ncnn.Mat.from_pixels(padded_img, ncnn.Mat.PixelType.PIXEL_BGR, target_size, target_size)
-
-        # Apply normalization (mean subtraction and scaling)
         mat_in.substract_mean_normalize(NCNN_MEAN_VALS, NCNN_NORM_VALS)
 
     except Exception as e:
@@ -344,8 +329,8 @@ def detect_signs_and_get_results(input_frame_bgr):
     # --- NCNN Inference ---
     try:
         ex = net.create_extractor()
-        ex.input(NCNN_INPUT_NAME, mat_in) # Input the preprocessed data
-        ret_extract, mat_out = ex.extract(NCNN_OUTPUT_NAME) # Run inference
+        ex.input(NCNN_INPUT_NAME, mat_in)
+        ret_extract, mat_out = ex.extract(NCNN_OUTPUT_NAME)
         if ret_extract != 0:
             print(f"NCNN Extract Error {ret_extract}")
             return detections_results
@@ -354,130 +339,111 @@ def detect_signs_and_get_results(input_frame_bgr):
         return detections_results
 
     # --- Post-processing YOLO Output ---
-    output_data = np.array(mat_out) # Convert output Mat to numpy array
+    output_data = np.array(mat_out)
 
-    # Common output shapes: (1, num_boxes, box_data+classes) or (box_data+classes, num_boxes)
-    # Reshape/Transpose if necessary to get (num_boxes, box_data+classes)
-    # box_data usually is [cx, cy, w, h, confidence] = 5 elements
-    expected_output_dim = 4 + 1 + NCNN_NUM_CLASSES # cx, cy, w, h, conf, classes...
+    # Adjust expected dimension calculation (NO separate objectness score)
+    expected_output_dim = 4 + NCNN_NUM_CLASSES # cx, cy, w, h + classes = 4 + 21 = 25
 
+    # Handle potential shapes: (1, 8400, 25) or (25, 8400)
     if len(output_data.shape) == 3 and output_data.shape[0] == 1:
-         output_data = output_data[0] # Remove batch dimension
+         # Shape is (1, N, 25) -> Reshape to (N, 25)
+         output_data = output_data[0]
     elif len(output_data.shape) == 2 and output_data.shape[0] == expected_output_dim:
-         output_data = output_data.T # Transpose if classes are rows
-    # Check final shape
+         # Shape is (25, N) -> Transpose to (N, 25)
+         output_data = output_data.T
+    # Check final shape after potential reshape/transpose
     if len(output_data.shape) != 2 or output_data.shape[1] != expected_output_dim:
-        print(f"Unexpected NCNN output shape: {output_data.shape}. Expected (N, {expected_output_dim}) after processing.")
-        return detections_results
+        # Print the ACTUAL shape received vs expected
+        print(f"Unexpected NCNN output shape after processing: {output_data.shape}. Expected (N, {expected_output_dim})")
+        return detections_results # Exit if shape is still wrong
 
-    num_detections = output_data.shape[0]
+    num_detections = output_data.shape[0] # Should be 8400
     boxes = []
     confidences = []
     class_ids = []
 
     # Decode detections
     for i in range(num_detections):
-        detection = output_data[i]
-        obj_confidence = detection[4] # Objectness score from the model
+        detection = output_data[i] # Shape (25,)
+        # Box coordinates are the first 4 elements
+        cx, cy, w_ncnn, h_ncnn = detection[:4]
+        # Class scores are the remaining elements
+        class_scores = detection[4:] # Shape (21,)
 
-        # Filter based on objectness confidence first
-        if obj_confidence >= NCNN_CONFIDENCE_THRESHOLD:
-            class_scores = detection[5:] # Scores for each class
-            class_id = np.argmax(class_scores)
-            max_class_score = np.max(class_scores)
-            # Combine objectness score with class score for final confidence
-            final_confidence = obj_confidence * max_class_score
+        # Find the class with the highest score
+        class_id = np.argmax(class_scores)
+        max_class_score = np.max(class_scores)
 
-            # Filter based on the final combined confidence
-            if final_confidence >= NCNN_CONFIDENCE_THRESHOLD:
-                # Extract box coordinates (relative to NCNN_INPUT_SIZE)
-                cx, cy, w_ncnn, h_ncnn = detection[:4]
+        # Use the max class score AS the confidence score for filtering
+        final_confidence = max_class_score
 
-                # --- Scale box back to ORIGINAL image coordinates ---
-                # 1. Convert center, w, h (relative to input_size) to x1,y1,x2,y2 (relative to input_size)
-                x1_resized = (cx - w_ncnn / 2)
-                y1_resized = (cy - h_ncnn / 2)
-                x2_resized = (cx + w_ncnn / 2)
-                y2_resized = (cy + h_ncnn / 2)
+        # Filter based on this confidence score
+        if final_confidence >= NCNN_CONFIDENCE_THRESHOLD:
+            # --- Scale box back to ORIGINAL image coordinates ---
+            # (Keep the scaling/clamping logic exactly as before)
+            x1_resized = (cx - w_ncnn / 2)
+            y1_resized = (cy - h_ncnn / 2)
+            x2_resized = (cx + w_ncnn / 2)
+            y2_resized = (cy + h_ncnn / 2)
 
-                # 2. Map back to original image coordinates (before resize/padding)
-                # Use scale and padding calculated during preprocessing
-                # scale = min(target_size / original_width, target_size / original_height)
-                # dw = (target_size - new_w) // 2
-                # dh = (target_size - new_h) // 2
+            x1_nopad = x1_resized - dw
+            y1_nopad = y1_resized - dh
+            x2_nopad = x2_resized - dw
+            y2_nopad = y2_resized - dh
 
-                # Remove padding offset (from top-left corner)
-                x1_nopad = x1_resized - dw
-                y1_nopad = y1_resized - dh
-                x2_nopad = x2_resized - dw
-                y2_nopad = y2_resized - dh
+            if scale > 1e-6:
+                x1_orig = x1_nopad / scale
+                y1_orig = y1_nopad / scale
+                x2_orig = x2_nopad / scale
+                y2_orig = y2_nopad / scale
+            else:
+                 x1_orig, y1_orig, x2_orig, y2_orig = 0, 0, 0, 0
 
-                # Rescale to original image size by dividing by the scale factor
-                # Add safety check for scale != 0
-                if scale > 1e-6:
-                    x1_orig = x1_nopad / scale
-                    y1_orig = y1_nopad / scale
-                    x2_orig = x2_nopad / scale
-                    y2_orig = y2_nopad / scale
-                else: # Should not happen if original dimensions > 0
-                     x1_orig, y1_orig, x2_orig, y2_orig = 0, 0, 0, 0
+            w_orig = x2_orig - x1_orig
+            h_orig = y2_orig - y1_orig
 
-                # Calculate final width and height in original image pixels
-                w_orig = x2_orig - x1_orig
-                h_orig = y2_orig - y1_orig
+            x1_orig = max(0, x1_orig)
+            y1_orig = max(0, y1_orig)
+            w_orig = min(original_width - x1_orig -1 , w_orig)
+            h_orig = min(original_height - y1_orig -1, h_orig)
+            w_orig = max(0, w_orig)
+            h_orig = max(0, h_orig)
 
-                # Clamp coordinates to ensure they are within original image bounds
-                x1_orig = max(0, x1_orig)
-                y1_orig = max(0, y1_orig)
-                # Adjust width/height based on clamped top-left corner
-                w_orig = min(original_width - x1_orig -1 , w_orig) # Ensure x1+w < width
-                h_orig = min(original_height - y1_orig -1, h_orig) # Ensure y1+h < height
-                w_orig = max(0, w_orig) # Ensure width/height are not negative
-                h_orig = max(0, h_orig)
+            # Store the box, confidence (max class score), and class ID for NMS
+            boxes.append([int(x1_orig), int(y1_orig), int(w_orig), int(h_orig)])
+            confidences.append(float(final_confidence)) # Use max_class_score here
+            class_ids.append(class_id)
 
-                # Store the box in [x, y, w, h] format for NMS
-                boxes.append([int(x1_orig), int(y1_orig), int(w_orig), int(h_orig)])
-                confidences.append(float(final_confidence))
-                class_ids.append(class_id)
-
-    # Apply Non-Maximum Suppression (NMS) to remove overlapping boxes
+    # Apply Non-Maximum Suppression (NMS)
     indices = []
-    if boxes: # Only run NMS if there are boxes found above threshold
+    if boxes:
         indices = cv2.dnn.NMSBoxes(boxes, confidences, NCNN_CONFIDENCE_THRESHOLD, NCNN_NMS_THRESHOLD)
 
-    # Process final detections after NMS
+    # Process final detections after NMS (This part should be okay)
     if len(indices) > 0:
-         # Flatten indices if it's returned as a list of lists/arrays
          if isinstance(indices, (list, tuple)) and len(indices) > 0 and isinstance(indices[0], (list, np.ndarray)):
             indices = indices.flatten()
-
-         processed_indices = set() # Keep track to avoid duplicates if NMS returns repeated indices
+         processed_indices = set()
          for idx in indices:
-            i = int(idx) # Get the index from NMS result
-            # Check index validity and prevent duplicates
+            i = int(idx)
             if 0 <= i < len(boxes) and i not in processed_indices:
                 box = boxes[i]
-                x, y, w, h = box # Unpack the final box coordinates
-                confidence_nms = confidences[i]
+                x, y, w, h = box
+                confidence_nms = confidences[i] # Confidence used by NMS
                 class_id_nms = class_ids[i]
-                processed_indices.add(i) # Mark as processed
-
-                # Get class name from ID
+                processed_indices.add(i)
                 if 0 <= class_id_nms < len(NCNN_CLASS_NAMES):
                     class_name = NCNN_CLASS_NAMES[class_id_nms]
                 else:
-                    class_name = f"ID:{class_id_nms}" # Fallback if ID is out of range
-
-                # Append the final detection result
+                    class_name = f"ID:{class_id_nms}"
                 detections_results.append({
                     "name": class_name,
                     "confidence": confidence_nms,
-                    "box": box, # Store the box [x, y, w, h] in original coordinates
-                    "width": w, # Store width for convenience
-                    "height": h # Store height for convenience
+                    "box": box,
+                    "width": w,
+                    "height": h
                 })
     return detections_results
-
 
 # --- Speed Limit Parsing Function ---
 def parse_speed_limit(class_name):
