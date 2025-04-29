@@ -1,0 +1,956 @@
+# -*- coding: utf-8 -*-
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import time
+import serial
+import struct
+import ncnn  # Import the ncnn Python binding
+import re    # Import regular expressions for parsing speed limits
+
+# --- Configuration ---
+# NCNN Object Detection Config
+PARAM_PATH = "/home/labthayphuc/Desktop/yolov11ncnn/yolov11n_int8_final.param" # <<< UPDATE PATH IF NEEDED
+BIN_PATH = "/home/labthayphuc/Desktop/yolov11ncnn/yolov11n_int8_final.bin"   # <<< UPDATE PATH IF NEEDED
+NCNN_INPUT_SIZE = 640
+NCNN_CONFIDENCE_THRESHOLD = 0.35 # Confidence threshold for final detection
+NCNN_NMS_THRESHOLD = 0.35      # Non-Maximum Suppression threshold
+NCNN_NUM_CLASSES = 21          # <<< UPDATED based on your list
+NCNN_CLASS_NAMES = [           # <<< UPDATED based on your list
+    'Pedestrian Crossing', 'Radar', 'Speed Limit -100-', 'Speed Limit -120-',
+    'Speed Limit -20-', 'Speed Limit -30-', 'Speed Limit -40-', 'Speed Limit -50-',
+    'Speed Limit -60-', 'Speed Limit -70-', 'Speed Limit -80-', 'Speed Limit -90-',
+    'Stop Sign', 'Traffic Light -Green-', 'Traffic Light -Off-',
+    'Traffic Light -Red-', 'Traffic Light -Yellow-','Pessoa','car',
+    'dotted-line','line'
+]
+NCNN_INPUT_NAME = "in0"       # Default input layer name
+NCNN_OUTPUT_NAME = "out0"     # Default output layer name
+NCNN_MEAN_VALS = [0.0, 0.0, 0.0] # Mean values for normalization
+NCNN_NORM_VALS = [1/255.0, 1/255.0, 1/255.0] # Normalization scale factors
+MIN_SIGN_WIDTH_OR_HEIGHT = 100 # Size threshold for non-line objects
+
+# Lane Keeping & Motor Control Config
+SERIAL_PORT = '/dev/ttyUSB0'    # <<< ADJUST Serial Port
+BAUD_RATE = 115200              # <<< MATCH ESP32 Baud Rate
+PICAM_SIZE = (640, 480)         # Camera resolution (MUST BE 640x480 for this NCNN preprocessing logic)
+PICAM_FRAMERATE = 30            # Camera framerate
+LANE_WIDTH_ASSUMPTION_PIXELS = 380 # EXAMPLE VALUE - TUNE THIS! Used for model fallback CTE calculation
+
+# Perspective Warp Points (Tune these based on camera mount)
+leftTop = 160
+heightTop = 150
+rightTop = 160
+leftBottom = 20
+heightBottom = 380
+rightBottom = 20
+
+# Speed Control Config
+DEFAULT_MAX_SPEED = 120 # Default speed limit if none detected
+MANUAL_MAX_SPEED = 100  # Max speed allowed with manual 'w' key
+MANUAL_ACCELERATION = 5 # Speed increment/decrement with 'w'/'s'
+AUTO_MODE_SPEED_STRAIGHT = 30 # Target speed in auto mode ('a') on straight sections
+AUTO_MODE_SPEED_CURVE = 20    # Target speed in auto mode ('a') on curved sections
+
+# --- Global Variables (State and Shared Data) ---
+# Image Data
+frame = None           # Current BGR frame from camera
+imgWarp = None         # Current warped binary image for traditional lane finding
+
+# Hardware Interfaces (initialized later)
+piCam = None           # Picamera2 object
+net = None             # NCNN Net object
+ser = None             # Serial object
+
+# Vehicle State / Commands
+steering = 90          # Current steering servo angle command (0-180, 90=center)
+speed_motor_requested = 0 # Target speed requested by manual keys or auto mode (km/h)
+flag = 1               # Legacy flag related to manual speed control
+current_speed_limit = DEFAULT_MAX_SPEED # Current active speed limit
+
+# Traditional Lane Finding State (modified by SteeringAngle)
+cte_f = 0.0            # Cross-Track Error calculated from warped image
+left_point = -1        # X-coordinate of detected left lane edge at bottom of warp
+right_point = -1       # X-coordinate of detected right lane edge at bottom of warp
+pre_diff = 0           # Previous difference state (if using IIR filter in SteeringAngle)
+lane_width = 500       # Estimated lane width from warp (dynamic)
+lane_width_max = 500   # Max observed lane width from warp
+interested_line_y = 0  # Last Y-coordinate scanned in SteeringAngle
+im_height = 0          # Height of warped image
+im_width = 0           # Width of warped image
+
+# Model-Based Lane Finding State (Persistent across frames)
+last_known_innermost_left_x = -1.0 # Last known X-coord of left line from model
+last_known_innermost_right_x = -1.0# Last known X-coord of right line from model
+cte_source = "Initializing" # Tracks which method determined the current CTE
+
+# Performance Monitoring State
+frame_counter = 0
+loop_start_time = 0.0
+overall_fps = 0.0
+
+# --- Helper Functions ---
+
+def process_image():
+    """ Captures frame, converts to BGR, preprocesses for lanes, and warps perspective.
+        Updates global 'frame' and 'imgWarp'. Returns True on success, False on capture failure.
+    """
+    global frame, imgWarp, leftTop, heightTop, rightTop, leftBottom, heightBottom, rightBottom, piCam
+    if piCam is None: return False # Camera not initialized
+
+    try:
+        rgb_frame = piCam.capture_array()
+    except Exception as e:
+        print(f"Capture Error: {e}")
+        frame = None
+        imgWarp = None
+        return False # Indicate capture failure
+
+    if rgb_frame is None:
+        frame = None
+        imgWarp = None
+        return False
+
+    # Convert to BGR *immediately* for NCNN detection compatibility
+    frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+
+    # --- Lane processing using grayscale for traditional method ---
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (11, 11), 0)
+    edges = cv2.Canny(blur, 100, 150, apertureSize=3) # Canny edge detection
+    h, w = edges.shape
+
+    # Define perspective transform points
+    points = np.float32([(leftTop, heightTop), (w - rightTop, heightTop),
+                         (leftBottom, heightBottom), (w - rightBottom, heightBottom)])
+    pts2 = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+
+    # Apply perspective warp
+    try:
+        matrix = cv2.getPerspectiveTransform(points, pts2)
+        imgWarp = cv2.warpPerspective(edges, matrix, (w, h)) # Output is global imgWarp
+    except cv2.error as e:
+        print(f"Warp Error: {e}")
+        imgWarp = None # Set warp to None on error
+        # Still return True because frame capture was successful
+
+    return True # Indicate frame capture success
+
+def ve_truc_anh(img, step=100):
+    """ Draws coordinate axes and grid lines on an image. """
+    if img is None: return None # Handle None input gracefully
+    # Ensure image is BGR for drawing colors
+    if len(img.shape) == 2: # If grayscale
+        img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    else:
+        img_color = img.copy() # Work on a copy
+
+    h, w = img_color.shape[:2]
+    if h == 0 or w == 0: return img_color # Return if dimensions are invalid
+
+    # Draw axes
+    cv2.line(img_color, (0, h - 1), (w, h - 1), (200, 200, 200), 1) # X axis
+    cv2.line(img_color, (0, 0), (0, h), (200, 200, 200), 1)       # Y axis
+    # Draw grid markers and labels
+    for x in range(0, w, step):
+        cv2.line(img_color, (x, h - 10), (x, h), (200, 200, 200), 1)
+        cv2.putText(img_color, str(x), (x + 2, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    for y in range(0, h, step):
+        cv2.line(img_color, (0, y), (10, y), (200, 200, 200), 1)
+        cv2.putText(img_color, str(y), (12, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    return img_color
+
+def SteeringAngle():
+    """ Calculates CTE based on warped image edges (Traditional Method).
+        Updates global variables: cte_f, left_point, right_point, im_height, im_width, etc.
+    """
+    global left_point, right_point, interested_line_y, im_height, im_width
+    global lane_width, lane_width_max, cte_f, pre_diff, imgWarp
+
+    # Reset outputs for this run
+    left_point = -1
+    right_point = -1
+    cte_f = 0.0 # Default to 0 if calculation fails
+
+    if imgWarp is None or imgWarp.size == 0:
+        # print("Debug: No warped image for SteeringAngle.") # Optional debug
+        return # Cannot calculate if warp image isn't available
+
+    h_warp, w_warp = imgWarp.shape[:2]
+    if h_warp == 0 or w_warp == 0: return # Invalid warp dimensions
+
+    # Update global dimensions if they changed
+    if im_height != h_warp: im_height = h_warp
+    if im_width != w_warp: im_width = w_warp
+
+    center_img = w_warp // 2
+    set_point = 300 # Y-coordinate target line for CTE calculation base
+    set_point = max(0, min(set_point, h_warp - 1)) # Clamp within bounds
+
+    # Iterative weighted CTE calculation
+    step = -5 # Scan upwards from bottom
+    diff_accumulator = 0.0
+    weight_sum = 0.0
+
+    for i in range(h_warp - 1, set_point + step, step): # Iterate from bottom up
+        current_y = int(i)
+        if not (0 <= current_y < h_warp): continue # Bounds check
+
+        interested_line_y = current_y # Update global for visualization
+        interested_line = imgWarp[current_y, :] # Get the row of pixels
+
+        # Find left point (scan from center to left)
+        current_left = -1
+        indices_left = np.where(interested_line[:center_img] > 0)[0]
+        if len(indices_left) > 0:
+            current_left = indices_left[-1] # Innermost white pixel on the left
+            if i == (h_warp - 1): left_point = current_left # Store bottom-most found point
+
+        # Find right point (scan from center to right)
+        current_right = -1
+        indices_right = np.where(interested_line[center_img:] > 0)[0]
+        if len(indices_right) > 0:
+            current_right = center_img + indices_right[0] # Innermost white pixel on the right
+            if i == (h_warp - 1): right_point = current_right # Store bottom-most found point
+
+        # Estimate missing points using max observed lane width
+        final_left = current_left
+        final_right = current_right
+        # Update lane width estimate if both points found
+        if current_left != -1 and current_right != -1:
+             current_lane_width = current_right - current_left
+             lane_width = current_lane_width # Update current dynamic width
+             if current_lane_width > lane_width_max: lane_width_max = current_lane_width # Update max observed
+             lane_width_max = max(lane_width_max, 50) # Apply minimum width constraint
+
+        # Estimate one side if the other is found
+        if final_left != -1 and final_right == -1:
+            final_right = final_left + lane_width_max
+        elif final_right != -1 and final_left == -1:
+            final_left = final_right - lane_width_max
+
+        # Calculate midpoint and difference for this line if possible
+        if final_left != -1 or final_right != -1:
+            # Calculate midpoint robustly
+            if final_left == -1: mid_point = final_right - lane_width_max / 2.0
+            elif final_right == -1: mid_point = final_left + lane_width_max / 2.0
+            else: mid_point = (final_left + final_right) / 2.0
+
+            diff = float(center_img) - mid_point # Calculate error for this line
+
+            # Weighting: lines closer to set_point have higher weight
+            # Weight = 1 at set_point, decreasing linearly to 0 at the bottom edge
+            weight = 0.0
+            if (h_warp - set_point) > 0: # Avoid division by zero if set_point is at the bottom
+                 weight = max(0, 1.0 - abs(float(current_y - set_point)) / float(h_warp - set_point))
+
+            diff_accumulator += diff * weight
+            weight_sum += weight
+
+    # Calculate final CTE as the weighted average
+    if weight_sum > 1e-6: # Avoid division by zero
+      cte_f = diff_accumulator / weight_sum
+    else:
+      cte_f = 0.0 # No weighted lines found, CTE is zero
+
+def signal_motor(key):
+    """ Updates the global 'speed_motor_requested' based on key input. """
+    global speed_motor_requested, flag, cte_f # Uses cte_f for auto mode speed calc
+    new_speed_req = speed_motor_requested # Start with current speed
+    # Manual Speed Control
+    if key == ord('w'): # Increase speed
+        new_speed_req = min(speed_motor_requested + MANUAL_ACCELERATION, MANUAL_MAX_SPEED)
+        flag = 1 # What does flag do? Assume it indicates manual interaction.
+    elif key == ord('s'): # Decrease speed
+        new_speed_req = max(speed_motor_requested - MANUAL_ACCELERATION, 0) # Speed cannot be negative
+    # Auto Speed Control ('a' key)
+    elif key == ord('a'): # Set speed based on current curvature (estimated by CTE)
+        # Simple logic: slower on curves (high |CTE|), faster on straights (low |CTE|)
+        target_speed = AUTO_MODE_SPEED_STRAIGHT if abs(cte_f) < 10 else AUTO_MODE_SPEED_CURVE
+        new_speed_req = target_speed
+        flag = 1 # Indicates auto mode was just activated/set
+    # Stop ('x' key)
+    elif key == ord('x'): # Emergency stop / manual stop
+        new_speed_req = 0
+
+    # Update global state only if changed
+    if new_speed_req != speed_motor_requested:
+        speed_motor_requested = new_speed_req
+
+# --- PID Class ---
+class PID:
+    """ Simple PID Controller Class with delta_time calculation. """
+    def __init__(self, kp, ki, kd):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.error_previous = 0.0 # Use float for errors
+        self.integral = 0.0       # Use float for integral
+        self.last_time = time.time() # Initialize time for first dt calculation
+
+    def update(self, error_f):
+        """ Calculates PID output based on error and elapsed time. """
+        current_time = time.time()
+        delta_time = current_time - self.last_time
+        # Prevent unrealistic derivative with tiny or zero delta_time
+        if delta_time <= 1e-6:
+             delta_time = 1e-6 # Use a small minimum timestep
+        self.last_time = current_time
+
+        # Proportional term
+        p_term = self.kp * error_f
+
+        # Integral term (consider adding integral limits/anti-windup for robustness)
+        self.integral += error_f * delta_time
+        i_term = self.ki * self.integral
+
+        # Derivative term
+        derivative = (error_f - self.error_previous) / delta_time
+        d_term = self.kd * derivative
+
+        # Store error for next iteration
+        self.error_previous = error_f
+
+        # Calculate total PID output (this is the steering deviation)
+        pid_output = p_term + i_term + d_term
+
+        # Convert PID output to servo angle (90 is center)
+        # Add limits to prevent servo damage or over-steering
+        steering_angle = 90.0 + pid_output # Apply deviation to center angle
+        # Clamp the servo angle to a safe operating range (e.g., 70-110)
+        steering_servo_angle = round(max(70, min(110, steering_angle)))
+
+        return steering_servo_angle
+
+# --- NCNN Detection Function ---
+def detect_signs_and_get_results(input_frame_bgr):
+    """ Performs NCNN object detection. Returns list of detected object dictionaries. """
+    global net, NCNN_INPUT_SIZE, NCNN_INPUT_NAME, NCNN_OUTPUT_NAME, NCNN_MEAN_VALS, NCNN_NORM_VALS
+    global NCNN_NUM_CLASSES, NCNN_CLASS_NAMES, NCNN_CONFIDENCE_THRESHOLD, NCNN_NMS_THRESHOLD
+
+    detections_results = []
+    # Basic checks for valid input
+    if input_frame_bgr is None or net is None: return detections_results
+    original_height, original_width = input_frame_bgr.shape[:2]
+    if original_height == 0 or original_width == 0: return detections_results
+
+    try:
+        # Preprocessing: Resize with padding and normalize
+        target_size = NCNN_INPUT_SIZE
+        # Calculate scaling factor to fit within target size while maintaining aspect ratio
+        scale = min(target_size / original_width, target_size / original_height)
+        new_w, new_h = int(original_width * scale), int(original_height * scale)
+        # Calculate padding dimensions
+        dw = (target_size - new_w) // 2
+        dh = (target_size - new_h) // 2
+
+        # Create NCNN Mat from image, resizing and padding implicitly if supported,
+        # otherwise manually pad then create Mat. Let's try resize first.
+        # NOTE: ncnn python bindings for from_pixels_resize might handle padding differently
+        # depending on the version. Verify its behavior or use manual padding.
+
+        # Manual Padding approach:
+        padded_img = np.full((target_size, target_size, 3), 114, dtype=np.uint8) # Pad with gray
+        # Check if new dimensions are valid before slicing
+        if new_w > 0 and new_h > 0:
+            resized_img = cv2.resize(input_frame_bgr, (new_w, new_h))
+            padded_img[dh:dh+new_h, dw:dw+new_w, :] = resized_img
+        else: # Handle case where resize results in zero dimension
+             padded_img = input_frame_bgr # Or handle error appropriately
+             print("Warning: Resize resulted in zero dimension.")
+
+
+        # Create NCNN Mat from the padded image
+        mat_in = ncnn.Mat.from_pixels(padded_img, ncnn.Mat.PixelType.PIXEL_BGR, target_size, target_size)
+
+        # Apply normalization (mean subtraction and scaling)
+        mat_in.substract_mean_normalize(NCNN_MEAN_VALS, NCNN_NORM_VALS)
+
+    except Exception as e:
+        print(f"NCNN Preprocessing Error: {e}")
+        return detections_results
+
+    # --- NCNN Inference ---
+    try:
+        ex = net.create_extractor()
+        ex.input(NCNN_INPUT_NAME, mat_in) # Input the preprocessed data
+        ret_extract, mat_out = ex.extract(NCNN_OUTPUT_NAME) # Run inference
+        if ret_extract != 0:
+            print(f"NCNN Extract Error {ret_extract}")
+            return detections_results
+    except Exception as e:
+        print(f"NCNN Inference Error: {e}")
+        return detections_results
+
+    # --- Post-processing YOLO Output ---
+    output_data = np.array(mat_out) # Convert output Mat to numpy array
+
+    # Common output shapes: (1, num_boxes, box_data+classes) or (box_data+classes, num_boxes)
+    # Reshape/Transpose if necessary to get (num_boxes, box_data+classes)
+    # box_data usually is [cx, cy, w, h, confidence] = 5 elements
+    expected_output_dim = 4 + 1 + NCNN_NUM_CLASSES # cx, cy, w, h, conf, classes...
+
+    if len(output_data.shape) == 3 and output_data.shape[0] == 1:
+         output_data = output_data[0] # Remove batch dimension
+    elif len(output_data.shape) == 2 and output_data.shape[0] == expected_output_dim:
+         output_data = output_data.T # Transpose if classes are rows
+    # Check final shape
+    if len(output_data.shape) != 2 or output_data.shape[1] != expected_output_dim:
+        print(f"Unexpected NCNN output shape: {output_data.shape}. Expected (N, {expected_output_dim}) after processing.")
+        return detections_results
+
+    num_detections = output_data.shape[0]
+    boxes = []
+    confidences = []
+    class_ids = []
+
+    # Decode detections
+    for i in range(num_detections):
+        detection = output_data[i]
+        obj_confidence = detection[4] # Objectness score from the model
+
+        # Filter based on objectness confidence first
+        if obj_confidence >= NCNN_CONFIDENCE_THRESHOLD:
+            class_scores = detection[5:] # Scores for each class
+            class_id = np.argmax(class_scores)
+            max_class_score = np.max(class_scores)
+            # Combine objectness score with class score for final confidence
+            final_confidence = obj_confidence * max_class_score
+
+            # Filter based on the final combined confidence
+            if final_confidence >= NCNN_CONFIDENCE_THRESHOLD:
+                # Extract box coordinates (relative to NCNN_INPUT_SIZE)
+                cx, cy, w_ncnn, h_ncnn = detection[:4]
+
+                # --- Scale box back to ORIGINAL image coordinates ---
+                # 1. Convert center, w, h (relative to input_size) to x1,y1,x2,y2 (relative to input_size)
+                x1_resized = (cx - w_ncnn / 2)
+                y1_resized = (cy - h_ncnn / 2)
+                x2_resized = (cx + w_ncnn / 2)
+                y2_resized = (cy + h_ncnn / 2)
+
+                # 2. Map back to original image coordinates (before resize/padding)
+                # Use scale and padding calculated during preprocessing
+                # scale = min(target_size / original_width, target_size / original_height)
+                # dw = (target_size - new_w) // 2
+                # dh = (target_size - new_h) // 2
+
+                # Remove padding offset (from top-left corner)
+                x1_nopad = x1_resized - dw
+                y1_nopad = y1_resized - dh
+                x2_nopad = x2_resized - dw
+                y2_nopad = y2_resized - dh
+
+                # Rescale to original image size by dividing by the scale factor
+                # Add safety check for scale != 0
+                if scale > 1e-6:
+                    x1_orig = x1_nopad / scale
+                    y1_orig = y1_nopad / scale
+                    x2_orig = x2_nopad / scale
+                    y2_orig = y2_nopad / scale
+                else: # Should not happen if original dimensions > 0
+                     x1_orig, y1_orig, x2_orig, y2_orig = 0, 0, 0, 0
+
+                # Calculate final width and height in original image pixels
+                w_orig = x2_orig - x1_orig
+                h_orig = y2_orig - y1_orig
+
+                # Clamp coordinates to ensure they are within original image bounds
+                x1_orig = max(0, x1_orig)
+                y1_orig = max(0, y1_orig)
+                # Adjust width/height based on clamped top-left corner
+                w_orig = min(original_width - x1_orig -1 , w_orig) # Ensure x1+w < width
+                h_orig = min(original_height - y1_orig -1, h_orig) # Ensure y1+h < height
+                w_orig = max(0, w_orig) # Ensure width/height are not negative
+                h_orig = max(0, h_orig)
+
+                # Store the box in [x, y, w, h] format for NMS
+                boxes.append([int(x1_orig), int(y1_orig), int(w_orig), int(h_orig)])
+                confidences.append(float(final_confidence))
+                class_ids.append(class_id)
+
+    # Apply Non-Maximum Suppression (NMS) to remove overlapping boxes
+    indices = []
+    if boxes: # Only run NMS if there are boxes found above threshold
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, NCNN_CONFIDENCE_THRESHOLD, NCNN_NMS_THRESHOLD)
+
+    # Process final detections after NMS
+    if len(indices) > 0:
+         # Flatten indices if it's returned as a list of lists/arrays
+         if isinstance(indices, (list, tuple)) and len(indices) > 0 and isinstance(indices[0], (list, np.ndarray)):
+            indices = indices.flatten()
+
+         processed_indices = set() # Keep track to avoid duplicates if NMS returns repeated indices
+         for idx in indices:
+            i = int(idx) # Get the index from NMS result
+            # Check index validity and prevent duplicates
+            if 0 <= i < len(boxes) and i not in processed_indices:
+                box = boxes[i]
+                x, y, w, h = box # Unpack the final box coordinates
+                confidence_nms = confidences[i]
+                class_id_nms = class_ids[i]
+                processed_indices.add(i) # Mark as processed
+
+                # Get class name from ID
+                if 0 <= class_id_nms < len(NCNN_CLASS_NAMES):
+                    class_name = NCNN_CLASS_NAMES[class_id_nms]
+                else:
+                    class_name = f"ID:{class_id_nms}" # Fallback if ID is out of range
+
+                # Append the final detection result
+                detections_results.append({
+                    "name": class_name,
+                    "confidence": confidence_nms,
+                    "box": box, # Store the box [x, y, w, h] in original coordinates
+                    "width": w, # Store width for convenience
+                    "height": h # Store height for convenience
+                })
+    return detections_results
+
+
+# --- Speed Limit Parsing Function ---
+def parse_speed_limit(class_name):
+    """ Extracts the numerical speed value from 'Speed Limit -VALUE-' class names. """
+    match = re.search(r'Speed Limit -(\d+)-', class_name)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None # Handle potential conversion error
+    return None # Return None if pattern doesn't match
+
+# --- Speed Transformation Function ---
+def transform_speed(velocity):
+    """ Converts desired velocity (km/h) to target motor RPM based on fixed ratios. """
+    if velocity <= 0: return 0 # Cannot have negative or zero speed for RPM calc
+
+    # Constants based on previous examples (verify these for your specific hardware)
+    gear_ratio = 30.0
+    reduction_ratio = 2.85
+    wheel_diameter_m = 0.095 # meters (derived from 0.0475 radius)
+    pi = np.pi
+
+    # Convert km/h to m/s
+    velocity_mps = velocity / 3.6
+    # Calculate wheel circumference
+    wheel_circumference = pi * wheel_diameter_m
+    # Calculate wheel RPM (Revolutions Per Minute)
+    # (m/s * 60 s/min) / (m/rev) = rev/min
+    if wheel_circumference <= 1e-6: return 0 # Avoid division by zero
+    wheel_rpm = (velocity_mps * 60) / wheel_circumference
+    # Calculate motor RPM considering gear ratios
+    motor_rpm = wheel_rpm * gear_ratio * reduction_ratio
+
+    return int(round(motor_rpm)) # Return integer RPM
+
+
+# ==============================================================================
+# ========================== MAIN EXECUTION BLOCK ============================
+# ==============================================================================
+if __name__ == "__main__":
+
+    # --- Initializations ---
+    # Serial Port
+    print(f"Initializing Serial on {SERIAL_PORT}...")
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1) # Assign to global 'ser'
+        time.sleep(2) # Allow time for Arduino/ESP32 to reset
+        print(f"Serial initialized on {SERIAL_PORT} at {BAUD_RATE} baud.")
+    except serial.SerialException as e:
+        print(f"CRITICAL: Serial Error: {e}. Could not open port {SERIAL_PORT}.")
+        ser = None # Ensure ser is None if failed
+    except Exception as e:
+        print(f"CRITICAL: An unexpected error occurred during serial initialization: {e}")
+        ser = None
+
+    # NCNN Model
+    print("Initializing NCNN Net...")
+    net = ncnn.Net() # Assign to global 'net'
+    print("Checking for Vulkan GPU...")
+    gpu_count = 0
+    try:
+        gpu_count = ncnn.get_gpu_count()
+    except Exception as e:
+        print(f"Warning: Could not query NCNN GPU count - {e}. Assuming CPU only.")
+
+    # Configure NCNN compute options
+    if gpu_count > 0:
+        print(f"NCNN: Vulkan GPU detected ({gpu_count} device(s)).")
+        net.opt.use_vulkan_compute = False # <<< SET TO True TO TRY GPU (ensure Vulkan SDK installed)
+        if net.opt.use_vulkan_compute: print("NCNN: Vulkan acceleration enabled.")
+    else:
+        print("NCNN: Vulkan GPU not found or check failed. Using CPU threads.")
+        net.opt.use_vulkan_compute = False
+    # Set CPU threads if not using GPU
+    if not net.opt.use_vulkan_compute:
+        net.opt.num_threads = 4 # Adjust based on your Pi 5's cores (4 is reasonable)
+        print(f"NCNN: Using {net.opt.num_threads} CPU threads.")
+
+    # Load NCNN model files
+    print("Loading NCNN model parameters and weights...")
+    try:
+        start_load_time = time.time()
+        if net.load_param(PARAM_PATH) != 0:
+            print(f"CRITICAL: Load NCNN Param Error: {PARAM_PATH}"); exit()
+        if net.load_model(BIN_PATH) != 0:
+            print(f"CRITICAL: Load NCNN Model Error: {BIN_PATH}"); exit()
+        end_load_time = time.time()
+        print(f"NCNN model loaded successfully in {end_load_time - start_load_time:.4f} seconds.")
+    except Exception as e:
+        print(f"CRITICAL: Exception during NCNN model loading: {e}"); exit()
+
+    # PiCamera2 Setup
+    print("Initializing Picamera2...")
+    piCam = Picamera2() # Assign to global 'piCam'
+    try:
+        preview_config = piCam.create_preview_configuration(main={"size": PICAM_SIZE, "format": "RGB888"})
+        piCam.configure(preview_config)
+        # Set framerate using controls after configure
+        piCam.set_controls({"FrameRate": float(PICAM_FRAMERATE)})
+        piCam.start()
+        time.sleep(1.0) # Allow camera to stabilize
+        print("Picamera2 started.")
+    except Exception as e:
+        print(f"CRITICAL: Picamera2 Error: {e}")
+        if piCam.started: piCam.stop() # Try to stop if started before error
+        exit()
+
+    # PID Controllers Initialization
+    pid_controller1 = PID(0.35, 0.001, 0.5) # PID for higher speeds (e.g., >= 20)
+    pid_controller2 = PID(1, 0.001, 0)      # PID for medium speeds (e.g., > 0 and < 20)
+    pid_controller3 = PID(1, 0.001, 0)      # PID potentially for very low speed or alternative? (Seems same as pid2)
+
+    # Initialize persistent state variables before the loop
+    last_known_innermost_left_x = -1.0
+    last_known_innermost_right_x = -1.0
+    current_speed_limit = DEFAULT_MAX_SPEED
+    speed_motor_requested = 0
+    steering = 90
+    cte_source = "Initializing"
+
+    # Initialize performance counters
+    frame_counter = 0
+    loop_start_time = time.time() # Start timer for overall FPS calculation
+    overall_fps = 0.0
+
+    # --- Main Control Loop ---
+    try:
+        frame_center_x = PICAM_SIZE[0] // 2 # Calculate center X once
+
+        while True:
+            frame_start_time_this = time.time() # Start timer for this specific frame
+
+            # --- Reset variables for CURRENT frame ---
+            current_frame_left_segments = []
+            current_frame_right_segments = []
+            innermost_left_line_x = -1.0
+            innermost_right_line_x = -1.0
+            detected_cte = None
+            final_cte_for_pid = 0.0 # Safety default
+            active_detections_this_frame = [] # Clear list for objects to draw this frame
+
+            # 1. Capture and Preprocess Image
+            # Updates global 'frame' (BGR) and 'imgWarp' (binary edges)
+            if not process_image():
+                print("Warning: Frame capture/processing failed. Skipping loop iteration.")
+                time.sleep(0.01) # Avoid busy-waiting on error
+                continue
+
+            # 2. Traditional Lane Finding (using warped image)
+            # Updates global cte_f, left_point, right_point
+            SteeringAngle()
+            traditional_found_both = (left_point != -1 and right_point != -1)
+
+            # 3. Model Detection (using original BGR frame)
+            detected_objects = []
+            if frame is not None: # Ensure frame is valid
+                detected_objects = detect_signs_and_get_results(frame)
+            else:
+                print("Warning: Original frame is None, skipping detection.")
+
+            # 4. Handle Key Presses for manual control/exit
+            key = cv2.waitKey(1) & 0xFF
+            signal_motor(key) # Updates global speed_motor_requested
+            if key == ord('q'):
+                print("'q' pressed, exiting loop.")
+                break # Exit the main while loop
+
+            # 5. Process Detections (Signs, Lines, etc.) with Conditional Size Filter
+            stop_condition_met = False
+            limit_sign_seen_this_frame = False
+            new_limit_value = -1 # Use -1 to indicate no limit parsed yet this frame
+
+            if detected_objects:
+                for detection in detected_objects:
+                    obj_name = detection['name']
+                    box = detection['box']
+                    x, y, w, h = box
+                    obj_w = detection.get('width', 0)
+                    obj_h = detection.get('height', 0)
+
+                    process_this_detection = False # Flag to check if detection should be processed
+
+                    # Apply filter logic: Lines always processed, others need size check
+                    if obj_name in ["dotted-line", "line"]: # <<< Use exact names from list
+                        process_this_detection = True # Process lines regardless of size
+                    else:
+                        # Apply size filter ONLY to non-line objects
+                        if obj_w > MIN_SIGN_WIDTH_OR_HEIGHT or obj_h > MIN_SIGN_WIDTH_OR_HEIGHT:
+                           process_this_detection = True
+
+                    # --- Process if flagged ---
+                    if process_this_detection:
+                        active_detections_this_frame.append(detection) # Add for drawing later
+
+                        # A. Lane Lines ("dotted-line", "line")
+                        if obj_name in ["dotted-line", "line"]:
+                            object_center_x = x + w / 2.0 # Calculate horizontal center
+                            segment_info = {'box': box, 'center_x': object_center_x, 'name': obj_name}
+                            # Classify as left/right based on position relative to frame center
+                            if object_center_x < frame_center_x:
+                                current_frame_left_segments.append(segment_info)
+                            elif object_center_x > frame_center_x:
+                                current_frame_right_segments.append(segment_info)
+
+                        # B. Stop Signs / Red Lights
+                        elif obj_name in ["Stop Sign", "Traffic Light -Red-"]:
+                            stop_condition_met = True # Set flag to stop
+
+                        # C. Speed Limits
+                        # Check only non-line, non-stop objects that passed size filter
+                        else:
+                            parsed_limit = parse_speed_limit(obj_name)
+                            if parsed_limit is not None:
+                                limit_sign_seen_this_frame = True
+                                # Track the lowest speed limit seen in the frame
+                                if new_limit_value == -1 or parsed_limit < new_limit_value:
+                                    new_limit_value = parsed_limit
+
+                        # D. Could add logic for 'Pessoa', 'car' here if needed (e.g., obstacle avoidance)
+
+            # 6. Update Model Lane Positions from Current Frame & Persist Last Known
+            # Find innermost left line segment detected THIS frame
+            if current_frame_left_segments:
+                innermost_left_segment = max(current_frame_left_segments, key=lambda item: item['center_x'])
+                innermost_left_line_x = innermost_left_segment['center_x']
+                last_known_innermost_left_x = innermost_left_line_x # PERSIST this value
+
+            # Find innermost right line segment detected THIS frame
+            if current_frame_right_segments:
+                innermost_right_segment = min(current_frame_right_segments, key=lambda item: item['center_x'])
+                innermost_right_line_x = innermost_right_segment['center_x']
+                last_known_innermost_right_x = innermost_right_line_x # PERSIST this value
+
+            # 7. Determine Final Steering CTE using Hierarchy Logic
+            if traditional_found_both:
+                final_cte_for_pid = cte_f # Use CTE from warped image edges
+                cte_source = "Traditional"
+            else: # Traditional method failed, try model-based
+                # Try using CURRENT model detections (check > 0 for float comparison)
+                if innermost_left_line_x > 0 and innermost_right_line_x > 0:
+                    detected_lane_center = (innermost_left_line_x + innermost_right_line_x) / 2.0
+                    final_cte_for_pid = float(frame_center_x) - detected_lane_center
+                    cte_source = "Model (Current)"
+                elif innermost_left_line_x > 0: # Only left found now
+                    detected_lane_center = innermost_left_line_x + LANE_WIDTH_ASSUMPTION_PIXELS / 2.0
+                    final_cte_for_pid = float(frame_center_x) - detected_lane_center
+                    cte_source = "Model (Current-L)"
+                elif innermost_right_line_x > 0: # Only right found now
+                    detected_lane_center = innermost_right_line_x - LANE_WIDTH_ASSUMPTION_PIXELS / 2.0
+                    final_cte_for_pid = float(frame_center_x) - detected_lane_center
+                    cte_source = "Model (Current-R)"
+                else: # Model failed this frame, try LAST KNOWN model detections
+                    if last_known_innermost_left_x > 0 and last_known_innermost_right_x > 0:
+                        detected_lane_center = (last_known_innermost_left_x + last_known_innermost_right_x) / 2.0
+                        final_cte_for_pid = float(frame_center_x) - detected_lane_center
+                        cte_source = "Model (Last Known)"
+                    elif last_known_innermost_left_x > 0: # Use last known left
+                        detected_lane_center = last_known_innermost_left_x + LANE_WIDTH_ASSUMPTION_PIXELS / 2.0
+                        final_cte_for_pid = float(frame_center_x) - detected_lane_center
+                        cte_source = "Model (Last Known-L)"
+                    elif last_known_innermost_right_x > 0: # Use last known right
+                        detected_lane_center = last_known_innermost_right_x - LANE_WIDTH_ASSUMPTION_PIXELS / 2.0
+                        final_cte_for_pid = float(frame_center_x) - detected_lane_center
+                        cte_source = "Model (Last Known-R)"
+                    else: # All methods failed
+                        final_cte_for_pid = 0.0 # Default to straight
+                        cte_source = "Default (0.0)"
+
+            # 8. Update Active Speed Limit
+            if limit_sign_seen_this_frame and new_limit_value != -1: # Check if a valid limit was parsed
+                if new_limit_value != current_speed_limit:
+                    print(f"** Speed Limit Updated: {new_limit_value} km/h **")
+                    current_speed_limit = new_limit_value
+            # Add logic here to potentially reset speed limit if no sign seen for a while? (Optional)
+
+            # 9. Determine Final Commanded Speed (km/h and RPM)
+            # Start with the speed requested by user/auto mode
+            final_speed_command_vel = speed_motor_requested
+            # Apply the current speed limit
+            final_speed_command_vel = min(final_speed_command_vel, current_speed_limit)
+            # Apply stop condition if met
+            if stop_condition_met:
+                if final_speed_command_vel > 0:
+                    print("** Stop condition met! Setting speed to 0. **")
+                final_speed_command_vel = 0 # Force speed to zero
+            # Convert final velocity command to RPM for the motor controller
+            final_speed_command_rpm = transform_speed(final_speed_command_vel)
+
+            # 10. PID Calculation for Steering Angle
+            # Select appropriate PID controller based on final commanded speed
+            current_pid = pid_controller3 # Default PID (e.g., for low speed)
+            if final_speed_command_vel >= 20 :
+                current_pid = pid_controller1 # High speed PID
+            elif final_speed_command_vel > 0: # Medium speed PID (adjust threshold as needed)
+                 current_pid = pid_controller2
+
+            # Calculate steering command using the selected PID and final CTE
+            steering = current_pid.update(final_cte_for_pid)
+
+            # 11. Send Commands to ESP32/Arduino via Serial
+            if ser and ser.is_open: # Check if serial port is valid and open
+                try:
+                    # Pack steering angle (int) and RPM (int) as two 4-byte integers ('<ii')
+                    data_to_send = struct.pack('<ii', steering, final_speed_command_rpm)
+                    # Send data with start/end markers
+                    ser.write(b'<' + data_to_send + b'>')
+                    ser.flush() # Ensure data is sent immediately
+                except serial.SerialException as e:
+                    print(f"Serial Write Error: {e}. Disabling serial.")
+                    ser.close() # Attempt to close the port
+                    ser = None # Mark serial as unavailable
+                except Exception as e:
+                     print(f"Unexpected Error during serial send: {e}")
+                     # Consider disabling serial here too
+                     if ser: ser.close()
+                     ser = None
+
+            # 12. Calculate and Print FPS / Status
+            frame_counter += 1
+            frame_time_this = time.time() - frame_start_time_this # Time for this frame
+            instant_fps = 1.0 / frame_time_this if frame_time_this > 0 else 0
+            elapsed_time_total = time.time() - loop_start_time # Total time since loop start
+            if elapsed_time_total > 1: # Update overall FPS approx every second
+                overall_fps = frame_counter / elapsed_time_total
+
+            # Print status periodically (e.g., every 30 frames)
+            if frame_counter % 30 == 0:
+                print(f"Status: Limit={current_speed_limit} | Req={speed_motor_requested} vel | Sent={final_speed_command_rpm} rpm | Steer={steering} | "
+                      f"CTE={final_cte_for_pid:.2f} (Source: {cte_source}) | TradOK={traditional_found_both} | "
+                      f"L={last_known_innermost_left_x:.1f} | R={last_known_innermost_right_x:.1f}")
+                print(f" FPS: {instant_fps:.1f} (Avg: {overall_fps:.1f})")
+
+            # 13. Display Visualization Windows
+            # --- Draw on Original Frame (Detections) ---
+            display_frame = frame.copy() if frame is not None else None # Work on a copy
+            if display_frame is not None:
+                # Add CTE source text
+                cv2.putText(display_frame, f"CTE Source: {cte_source}", (10, PICAM_SIZE[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                # Draw frame center line
+                cv2.line(display_frame, (frame_center_x, 0), (frame_center_x, PICAM_SIZE[1]), (255, 255, 255), 1)
+
+                # Draw all active detections that passed filters
+                for detection in active_detections_this_frame:
+                    d_x, d_y, d_w, d_h = detection['box']
+                    d_name = detection['name']
+                    d_conf = detection['confidence']
+                    label = f"{d_name}: {d_conf:.2f}"
+                    color = (0, 255, 0) # Default: Green
+                    thickness = 2       # Default thickness
+
+                    # Customize drawing for Lane Lines
+                    if d_name in ["dotted-line", "line"]:
+                        obj_center_x = d_x + d_w / 2.0
+                        is_innermost = False
+                        # Check if it's the left line and if it's the one chosen as innermost
+                        if obj_center_x < frame_center_x:
+                            label += " (LEFT)"
+                            color = (255, 165, 0) # Orange
+                            if abs(obj_center_x - last_known_innermost_left_x) < 1: is_innermost = True
+                        # Check if it's the right line and if it's the one chosen as innermost
+                        elif obj_center_x > frame_center_x:
+                            label += " (RIGHT)"
+                            color = (255, 0, 255) # Magenta
+                            if abs(obj_center_x - last_known_innermost_right_x) < 1: is_innermost = True
+                        # Make the box thicker if it's the innermost line used
+                        thickness = 3 if is_innermost else 1
+
+                    # Draw the rectangle and label
+                    cv2.rectangle(display_frame, (d_x, d_y), (d_x + d_w, d_y + d_h), color, thickness)
+                    cv2.putText(display_frame, label, (d_x, d_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, thickness)
+
+                # Draw markers for the final chosen innermost line positions at bottom
+                if last_known_innermost_left_x > 0:
+                    cv2.circle(display_frame, (int(last_known_innermost_left_x), PICAM_SIZE[1] - 20), 5, (255, 165, 0), -1)
+                    cv2.putText(display_frame, "L", (int(last_known_innermost_left_x) - 5, PICAM_SIZE[1] - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+                if last_known_innermost_right_x > 0:
+                    cv2.circle(display_frame, (int(last_known_innermost_right_x), PICAM_SIZE[1] - 20), 5, (255, 0, 255), -1)
+                    cv2.putText(display_frame, "R", (int(last_known_innermost_right_x) - 5, PICAM_SIZE[1] - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+
+                # Show the frame with detections
+                cv2.imshow("Object Detections", display_frame)
+
+            # --- Display Warped Lane Image (Traditional Method Debug) ---
+            if imgWarp is not None:
+                display_img_warp = ve_truc_anh(imgWarp, step=50) # Add grid lines
+                if display_img_warp is not None:
+                    # Add relevant text overlays for debugging traditional method
+                    cv2.putText(display_img_warp, f"Trad Found Both: {traditional_found_both}", (10, im_height - 60 if im_height>60 else 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+                    cv2.putText(display_img_warp, f"Trad CTE (cte_f): {cte_f:.2f}", (10, im_height - 40 if im_height>40 else 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+                    cv2.putText(display_img_warp, f"Final CTE: {final_cte_for_pid:.2f}", (10, im_height - 20 if im_height>20 else 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+
+                    # Draw traditional left/right points if found (at bottom)
+                    if left_point != -1: cv2.circle(display_img_warp, (left_point, im_height-1), 5, (0,0,255), -1) # Red circle
+                    if right_point != -1: cv2.circle(display_img_warp, (right_point, im_height-1), 5, (0,0,255), -1) # Red circle
+
+                    # Show the warped image window
+                    cv2.imshow("Lane Detection Warp", display_img_warp)
+            else:
+                # If warp failed, maybe clear the window?
+                # Or display a black image with text "Warp Failed"
+                pass # Currently does nothing if warp failed
+
+
+            # --- End of Loop ---
+
+    # --- Error Handling & Cleanup ---
+    except KeyboardInterrupt:
+        print("\nCtrl+C detected. Exiting...")
+    except Exception as e:
+        # Catch any other unexpected errors during the loop
+        print(f"\n--- UNHANDLED EXCEPTION IN MAIN LOOP ---")
+        print(f"Error Type: {type(e).__name__}")
+        print(f"Error Details: {e}")
+        import traceback
+        traceback.print_exc() # Print detailed traceback
+        print(f"--- END OF TRACEBACK ---")
+    finally:
+        # This block executes whether the loop exits normally (e.g., 'q') or via error
+        print("\nCleaning up resources...")
+
+        # Stop the motor gracefully (send stop command)
+        if ser and ser.is_open:
+            try:
+                print("Sending stop command to motor...")
+                # Center steering (90), zero speed (0 RPM)
+                stop_data = struct.pack('<ii', 90, 0)
+                ser.write(b'<' + stop_data + b'>')
+                ser.flush()
+                time.sleep(0.1) # Short delay to allow command processing
+                ser.close() # Close the serial port
+                print("Serial port closed.")
+            except Exception as e:
+                print(f"Error sending stop command or closing serial port: {e}")
+
+        # Stop the camera
+        if piCam and piCam.started:
+             try:
+                 piCam.stop()
+                 print("Picamera2 stopped.")
+             except Exception as e:
+                 print(f"Error stopping Picamera2: {e}")
+
+        # Close OpenCV display windows
+        cv2.destroyAllWindows()
+        print("OpenCV windows closed.")
+        print("Cleanup complete. Exiting program.")
