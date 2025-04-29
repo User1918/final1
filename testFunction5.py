@@ -493,8 +493,8 @@ def parse_speed_limit(class_name):
 # --- Speed Transformation Function ---
 def transform_speed(velocity):
     f_velocity = velocity / 10
-    rpm = (f_velocity *30*2.85)/(3.14*0.0475*3.6)
-    return int(round(rpm))
+     motor_rpm = (f_velocity *30*2.85)/(3.14*0.0475*3.6)
+    return int(round(motor_rpm))
 
 
 # ==============================================================================
