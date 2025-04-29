@@ -492,27 +492,9 @@ def parse_speed_limit(class_name):
 
 # --- Speed Transformation Function ---
 def transform_speed(velocity):
-    """ Converts desired velocity (km/h) to target motor RPM based on fixed ratios. """
-    if velocity <= 0: return 0 # Cannot have negative or zero speed for RPM calc
-
-    # Constants based on previous examples (verify these for your specific hardware)
-    gear_ratio = 30.0
-    reduction_ratio = 2.85
-    wheel_diameter_m = 0.095 # meters (derived from 0.0475 radius)
-    pi = np.pi
-
-    # Convert km/h to m/s
-    velocity_mps = velocity / 3.6
-    # Calculate wheel circumference
-    wheel_circumference = pi * wheel_diameter_m
-    # Calculate wheel RPM (Revolutions Per Minute)
-    # (m/s * 60 s/min) / (m/rev) = rev/min
-    if wheel_circumference <= 1e-6: return 0 # Avoid division by zero
-    wheel_rpm = (velocity_mps * 60) / wheel_circumference
-    # Calculate motor RPM considering gear ratios
-    motor_rpm = wheel_rpm * gear_ratio * reduction_ratio
-
-    return int(round(motor_rpm)) # Return integer RPM
+    f_velocity = velocity / 10
+    rpm = (f_velocity *30*2.85)/(3.14*0.0475*3.6)
+    return int(round(rpm))
 
 
 # ==============================================================================
