@@ -161,98 +161,69 @@ def ve_truc_anh(img, step=100):
     return img_color
 
 def SteeringAngle():
-    """ Calculates CTE based on warped image edges (Traditional Method).
-        Updates global variables: cte_f, left_point, right_point, im_height, im_width, etc.
-    """
-    global left_point, right_point, interested_line_y, im_height, im_width
-    global lane_width, lane_width_max, cte_f, pre_diff, imgWarp
-
-    # Reset outputs for this run
+    """TÃ­nh sai lá»‡ch lÃ¡i (CTE) dá»±a trÃªn quÃ©t cÃ¡c hÃ ng pixel cá»§a áº£nh warp."""
+    global left_point, right_point, interested_line_y
+    global im_height, im_width, lane_width, lane_width_max, cte_f
+    # Láº¥y kÃ­ch thÆ°á»›c hÃ¬nh warp hiá»‡n táº¡i
+    im_height, im_width = imgWarp.shape[:2]
+    # Khá»Ÿi táº¡o láº¡i giÃ¡ trá»‹ Ä‘iá»ƒm trÃ¡i vÃ  pháº£i cho má»—i frame
     left_point = -1
     right_point = -1
-    cte_f = 0.0 # Default to 0 if calculation fails
+    # TÃ­nh tÃ¢m áº£nh theo chiá»u ngang
+    center_img = im_width // 2
+    # Äáº·t má»©c quÃ©t Y (tá»« dÆ°á»›i lÃªn) Ä‘á»ƒ tÃ­nh CTE
+    set_point = 300
+    # Váº½ Ä‘Æ°á»ng target line lÃªn áº£nh Ä‘á»ƒ debug
+    cv2.line(imgWarp, (0, set_point), (im_width, set_point), (255, 0, 0), 2)
+    # Khá»Ÿi táº¡o biáº¿n lÆ°u sai lá»‡ch trÆ°á»›c Ä‘Ã³ cho lá»c IIR
+    pre_diff = 0
+    # BÆ°á»›c nháº£y má»—i láº§n quÃ©t hÃ ng ngang (pixel)
+    step = -5
+    # TÃ­nh sá»‘ bÆ°á»›c quÃ©t u = khoáº£ng cÃ¡ch quÃ©t / |step|
+    u = (im_height - set_point) / abs(step)
+    # TÃ­nh há»‡ sá»‘ trá»ng sá»‘ cho má»—i hÃ ng quÃ©t
+    ki = (-u / im_height) + 1
+    # VÃ²ng láº·p quÃ©t cÃ¡c hÃ ng ngang tá»« Ä‘Ã¡y hÃ¬nh lÃªn set_point
+    for i in range(im_height - 1, set_point, step):
+        #  GÃ¡n chá»‰ sá»‘ hÃ ng hiá»‡n táº¡i
+        interested_line_y = int(i)
+        # Láº¥y dÃ²ng pixel táº¡i y
+        interested_line = imgWarp[interested_line_y, :]
+        #  TÃ¬m Ä‘iá»ƒm lane bÃªn trÃ¡i gáº§n tÃ¢m (center_img)
+        for x in range(center_img, 0, -1):
+            if interested_line[x] > 0:
+                left_point = x
+                break
+        # TÃ¬m Ä‘iá»ƒm lane bÃªn pháº£i
+        for x in range(center_img + 1, im_width):
+            if interested_line[x] > 0:
+                right_point = x
+                break
+        # Cáº­p nháº­t Ä‘á»™ rá»™ng lane náº¿u cáº£ hai Ä‘iá»ƒm Ä‘á»u tÃ¬m Ä‘Æ°á»£c
+        if left_point != -1 and right_point != -1:
+            lane_width = right_point - left_point
+        # Æ¯á»›c lÆ°á»£ng náº¿u thiáº¿u Ä‘iá»ƒm pháº£i
+        if left_point != -1 and right_point == -1:
+            right_point = left_point + lane_width_max
+        # Æ¯á»›c lÆ°á»£ng náº¿u thiáº¿u Ä‘iá»ƒm trÃ¡i
+        if right_point != -1 and left_point == -1:
+            left_point = right_point - lane_width_max
+        # TÃ­nh midpoint cá»§a lane
+        mid_point = (right_point + left_point) / 2
+        # Sai lá»‡ch so vá»›i center
+        diff = center_img - mid_point
+        # Ãp dá»¥ng lá»c IIR: current_diff = diff * ki + pre_diff
+        diff = diff * ki + pre_diff
+        # Cáº­p nháº­t pre_diff cho vÃ²ng láº·p káº¿ tiáº¿
+        pre_diff = diff
 
-    if imgWarp is None or imgWarp.size == 0:
-        # print("Debug: No warped image for SteeringAngle.") # Optional debug
-        return # Cannot calculate if warp image isn't available
-
-    h_warp, w_warp = imgWarp.shape[:2]
-    if h_warp == 0 or w_warp == 0: return # Invalid warp dimensions
-
-    # Update global dimensions if they changed
-    if im_height != h_warp: im_height = h_warp
-    if im_width != w_warp: im_width = w_warp
-
-    center_img = w_warp // 2
-    set_point = 300 # Y-coordinate target line for CTE calculation base
-    set_point = max(0, min(set_point, h_warp - 1)) # Clamp within bounds
-
-    # Iterative weighted CTE calculation
-    step = -5 # Scan upwards from bottom
-    diff_accumulator = 0.0
-    weight_sum = 0.0
-
-    for i in range(h_warp - 1, set_point + step, step): # Iterate from bottom up
-        current_y = int(i)
-        if not (0 <= current_y < h_warp): continue # Bounds check
-
-        interested_line_y = current_y # Update global for visualization
-        interested_line = imgWarp[current_y, :] # Get the row of pixels
-
-        # Find left point (scan from center to left)
-        current_left = -1
-        indices_left = np.where(interested_line[:center_img] > 0)[0]
-        if len(indices_left) > 0:
-            current_left = indices_left[-1] # Innermost white pixel on the left
-            if i == (h_warp - 1): left_point = current_left # Store bottom-most found point
-
-        # Find right point (scan from center to right)
-        current_right = -1
-        indices_right = np.where(interested_line[center_img:] > 0)[0]
-        if len(indices_right) > 0:
-            current_right = center_img + indices_right[0] # Innermost white pixel on the right
-            if i == (h_warp - 1): right_point = current_right # Store bottom-most found point
-
-        # Estimate missing points using max observed lane width
-        final_left = current_left
-        final_right = current_right
-        # Update lane width estimate if both points found
-        if current_left != -1 and current_right != -1:
-             current_lane_width = current_right - current_left
-             lane_width = current_lane_width # Update current dynamic width
-             if current_lane_width > lane_width_max: lane_width_max = current_lane_width # Update max observed
-             lane_width_max = max(lane_width_max, 50) # Apply minimum width constraint
-
-        # Estimate one side if the other is found
-        if final_left != -1 and final_right == -1:
-            final_right = final_left + lane_width_max
-        elif final_right != -1 and final_left == -1:
-            final_left = final_right - lane_width_max
-
-        # Calculate midpoint and difference for this line if possible
-        if final_left != -1 or final_right != -1:
-            # Calculate midpoint robustly
-            if final_left == -1: mid_point = final_right - lane_width_max / 2.0
-            elif final_right == -1: mid_point = final_left + lane_width_max / 2.0
-            else: mid_point = (final_left + final_right) / 2.0
-
-            diff = float(center_img) - mid_point # Calculate error for this line
-
-            # Weighting: lines closer to set_point have higher weight
-            # Weight = 1 at set_point, decreasing linearly to 0 at the bottom edge
-            weight = 0.0
-            if (h_warp - set_point) > 0: # Avoid division by zero if set_point is at the bottom
-                 weight = max(0, 1.0 - abs(float(current_y - set_point)) / float(h_warp - set_point))
-
-            diff_accumulator += diff * weight
-            weight_sum += weight
-
-    # Calculate final CTE as the weighted average
-    if weight_sum > 1e-6: # Avoid division by zero
-      cte_f = diff_accumulator / weight_sum
-    else:
-      cte_f = 0.0 # No weighted lines found, CTE is zero
-
+        # Váº½ cÃ¡c Ä‘iá»ƒm tÃ¬m Ä‘Æ°á»£c lÃªn áº£nh warp Ä‘á»ƒ debug
+        if left_point != -1:
+            cv2.circle(imgWarp, (left_point, interested_line_y), 3, (255, 255, 255), -1)
+        if right_point != -1:
+            cv2.circle(imgWarp, (right_point, interested_line_y), 3, (255, 255, 255), -1)
+    # TÃ­nh Cross-Track Error (CTE) chuáº©n hÃ³a
+    cte_f = diff / u
 def signal_motor(key):
     """ Updates the global 'speed_motor_requested' based on key input. """
     global speed_motor_requested, flag, cte_f # Uses cte_f for auto mode speed calc
