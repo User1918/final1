@@ -577,12 +577,6 @@ if __name__ == "__main__":
                 # Fallback to Model-based logic using persistent last known positions
                 know_left = last_known_innermost_left_x > 0
                 know_right = last_known_innermost_right_x > 0
-
-                # Priority 2: Model knows both lanes
-                if know_left and know_right:
-                    detected_lane_center = (last_known_innermost_left_x + last_known_innermost_right_x) / 2.0
-                    final_cte_for_pid = float(frame_center_x) - detected_lane_center
-                    cte_source = "Model (Both Known)"
                 # Priority 3: Model knows only Left lane -> Steer to offset
                 elif know_left:
                     final_cte_for_pid = target_left_x_offset - last_known_innermost_left_x
