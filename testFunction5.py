@@ -571,7 +571,7 @@ if __name__ == "__main__":
             # Check the *final* state of left_point/right_point AFTER SteeringAngle() ran
             if left_point != -1 and right_point != -1:
                 final_cte_for_pid = cte_f # Use the CTE calculated by SteeringAngle (with IIR filter)
-                cte_source = "Traditional (IIR)"
+                cte_source = "Traditional"
             else:
                 # Traditional method failed (or only found one point reliably in its scan)
                 # Fallback to Model-based logic using persistent last known positions
