@@ -157,7 +157,38 @@ def ve_truc_anh(img, step=100):
         cv2.line(img_color, (0, y), (10, y), (200, 200, 200), 1)
         cv2.putText(img_color, str(y), (12, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
     return img_color
-
+def SteeringAngle():
+    """TÃ­nh sai lá»‡ch lÃ¡i (CTE) dá»±a trÃªn quÃ©t cÃ¡c hÃ ng pixel cá»§a áº£nh warp."""
+    global left_point, right_point, interested_line_y
+    global im_height, im_width, cte_f
+    im_height, im_width = imgWarp.shape[:2]
+    left_point = -1
+    right_point = -1
+    center_img = im_width // 2
+    set_point = 300
+    cv2.line(imgWarp, (0, set_point), (im_width, set_point), (255, 0, 0), 2)
+    pre_diff = 0
+    step = -5
+    u = (im_height - set_point) / abs(step)
+    ki = (-u / im_height) + 1
+    for i in range(im_height - 1, set_point, step):
+        interested_line_y = int(i)
+        interested_line = imgWarp[interested_line_y, :]
+        for x in range(center_img, 0, -1):
+            if interested_line[x] > 0:
+                left_point = x
+                break
+        for x in range(center_img + 1, im_width):
+            if interested_line[x] > 0:
+                right_point = x
+                break
+        if left_point != -1 and right_point != -1:
+            lane_width = right_point - left_point
+        mid_point = (right_point + left_point) / 2
+        diff = center_img - mid_point
+        diff = diff * ki + pre_diff
+        pre_diff = diff
+    cte_f = diff / u
 def signal_motor(key):
     """ Updates the global 'speed_motor_requested' based on key input. """
     global speed_motor_requested, flag, final_cte_for_pid # Uses final_cte_for_pid
