@@ -235,12 +235,6 @@ def SteeringAngle():
         # Cáº­p nháº­t Ä‘á»™ rá»™ng lane náº¿u cáº£ hai Ä‘iá»ƒm Ä‘á»u tÃ¬m Ä‘Æ°á»£c
         if left_point != -1 and right_point != -1:
             lane_width = right_point - left_point
-        # Æ¯á»›c lÆ°á»£ng náº¿u thiáº¿u Ä‘iá»ƒm pháº£i
-        if left_point != -1 and right_point == -1:
-            right_point = left_point + lane_width_max
-        # Æ¯á»›c lÆ°á»£ng náº¿u thiáº¿u Ä‘iá»ƒm trÃ¡i
-        if right_point != -1 and left_point == -1:
-            left_point = right_point - lane_width_max
         # TÃ­nh midpoint cá»§a lane
         mid_point = (right_point + left_point) / 2
         # Sai lá»‡ch so vá»›i center
@@ -249,12 +243,6 @@ def SteeringAngle():
         diff = diff * ki + pre_diff
         # Cáº­p nháº­t pre_diff cho vÃ²ng láº·p káº¿ tiáº¿
         pre_diff = diff
-
-        # Váº½ cÃ¡c Ä‘iá»ƒm tÃ¬m Ä‘Æ°á»£c lÃªn áº£nh warp Ä‘á»ƒ debug
-        if left_point != -1:
-            cv2.circle(imgWarp, (left_point, interested_line_y), 3, (255, 255, 255), -1)
-        if right_point != -1:
-            cv2.circle(imgWarp, (right_point, interested_line_y), 3, (255, 255, 255), -1)
     # TÃ­nh Cross-Track Error (CTE) chuáº©n hÃ³a
     cte_f = diff / u
 
