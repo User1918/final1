@@ -26,20 +26,24 @@
 const int PULSES_PER_REV = 5;
 volatile unsigned long pulseCount = 0;
 volatile float currentRPM = 0.0;
-const unsigned long RPM_CALC_INTERVAL_MS = 50;
+const unsigned long RPM_CALC_INTERVAL_MS = 600;
 const unsigned long RPM_CALC_INTERVAL_US = RPM_CALC_INTERVAL_MS * 1000;
 volatile unsigned long lastRpmCalcTime = 0;
 volatile unsigned long lastRpmCalcPulseCount = 0;
 esp_timer_handle_t rpm_timer_handle;
+
+// --- EMA Filters ---
+const float EMA_ALPHA = 0.05; // Smoothing factor (0.0 < alpha <= 1.0). TUNE THIS.
+float g_filteredRPM = 0.0;   // Global variable to hold the latest filtered RPM result
 
 // --- PID Controller ---
 float RPM_setpoint = 0.0; // Desired speed (RPM)
 
 // *** NEW PID GAINS - MUST BE RETUNED ***
 // These gains now relate RPM error to an RPM-based control effort
-float Kp = 0.5;  // Example starting value - TUNE ME!
-float Ki = 0.1;  // Example starting value - TUNE ME!
-float Kd = 0.005; // Example starting value - TUNE ME!
+float Kp = 0.8;  // Example starting value - TUNE ME!
+float Ki = 0.5;  // Example starting value - TUNE ME!
+float Kd = 0; // Example starting value - TUNE ME!
 
 // --- PID Timing & State Variables ---
 const unsigned long PID_INTERVAL_MS = 10;
@@ -53,9 +57,9 @@ int currentPWM = 0; // Stores the last calculated PWM value
 // These map the target RPM effort calculated by PID to a PWM value.
 // PWM = RPM_TO_PWM_SLOPE * targetEffort_RPM + RPM_TO_PWM_OFFSET
 // Needs experimental determination for your specific motor+load!
-const float RPM_TO_PWM_SLOPE = 2.0;  // Example: 2 PWM units per RPM - TUNE ME!
-const float RPM_TO_PWM_OFFSET = 20.0; // Example: PWM needed to start motion - TUNE ME!
-const float MAX_RPM_ESTIMATE = 150.0; // Example: Estimated max possible RPM for anti-windup - TUNE ME!
+const float RPM_TO_PWM_SLOPE = 0.05;  // Example: 2 PWM units per RPM - TUNE ME!
+const float RPM_TO_PWM_OFFSET = 4.6; // Example: PWM needed to start motion - TUNE ME!
+const float MAX_RPM_ESTIMATE = 4000; // Example: Estimated max possible RPM for anti-windup - TUNE ME!
 
 
 // --- Stop Detection Timer --- (Keep these)
@@ -155,22 +159,48 @@ void setMotorPWM(int pwmValue) {
     if (voltage_IS_R_mV < CURRENT_LIMIT_MV ) {
         digitalWrite(R_EN, HIGH);
         digitalWrite(L_EN, HIGH);
-        analogWrite(LPWM, pwmValue);
-        digitalWrite(RPWM, LOW);
+        analogWrite(RPWM, pwmValue);
+        digitalWrite(LPWM, LOW);
         motorRunning = (pwmValue > 0);
     } else {
         // Current limit exceeded! Stop the motor immediately
         Serial.println("!!! CURRENT LIMIT EXCEEDED !!!");
         digitalWrite(R_EN, LOW);
         digitalWrite(L_EN, LOW);
-        analogWrite(LPWM, 0);
-        digitalWrite(RPWM, LOW);
+        analogWrite(RPWM, 0);
+        digitalWrite(LPWM, LOW);
         motorRunning = false;
         integral = 0; // Reset integral term on fault
         currentPWM = 0;
     }
 }
+// =========================================================================
+// FUNCTION: EMA filter 
+// =========================================================================
+float updateEMA(float currentRawValue) {
+    // Static variables retain their value between function calls.
+    // Initialized only once when the function is first called.
+    static float previousEMA = 0.0; // Stores the last filtered value, persists across calls
+    static bool initialized = false; // Tracks if the filter has been seeded, persists across calls
 
+    // Initialize the filter with the first valid reading
+    // Note: If the first raw values might be 0 while the motor isn't moving,
+    // you might want to add a check like: if (!initialized && currentRawValue != 0.0)
+    if (!initialized) {
+        previousEMA = currentRawValue; // Seed with the first value
+        initialized = true;
+        return previousEMA; // Return the initial value the first time
+    }
+
+    // Apply the EMA formula: New Average = (Alpha * Current) + ((1 - Alpha) * Previous)
+    float currentEMA = (EMA_ALPHA * currentRawValue) + ((1.0 - EMA_ALPHA) * previousEMA);
+
+    // Update the state for the *next* time the function is called
+    previousEMA = currentEMA;
+
+    // Return the newly calculated filtered value
+    return currentEMA;
+}
 // =========================================================================
 // FUNCTION: calculatePID_RPM_Output (NEW PID Logic)
 // Calculates the required control effort (scaled in RPM units).
@@ -244,6 +274,8 @@ void control_servo() {
         digitalWrite(SERVO_PIN, HIGH);
         delayMicroseconds(pulseWidth);
         digitalWrite(SERVO_PIN, LOW);
+        
+        
     }
 }
 
@@ -257,38 +289,45 @@ void parseSerialData() {
         steering_angle = *((int32_t*)&serialBuffer[1]);
         received_speed = *((int32_t*)&serialBuffer[5]);
         RPM_setpoint = (float)received_speed;
+        Serial.println(steering_angle);
     } else {
         Serial.println("Invalid serial packet received.");
     }
     serialBufferIndex = 0;
 }
-
 // =========================================================================
-// FUNCTION: displayData (Keep this function as is)
+// FUNCTION: displayData (Modified to show filtered RPM)
 // =========================================================================
 void displayData() {
-   // ... (Keep the existing code for displayData) ...
     static unsigned long lastPrintTime = 0;
-    const unsigned long PRINT_INTERVAL_MS = 100; // Print data every 100ms
+    // Adjust PRINT_INTERVAL_MS if needed, 100ms is quite fast for plotting
+    const unsigned long PRINT_INTERVAL_MS = 200; // Example: Print every 200ms
 
     if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
         lastPrintTime = millis();
-        float measuredRPM;
+
+        // Get raw RPM value again just for display comparison
+        float rawRPM_display;
         noInterrupts();
-        measuredRPM = currentRPM;
+        rawRPM_display = currentRPM;
         interrupts();
 
+        // Prepare plotter output string
+        // Format: SetpointRPM,RawRPM,FilteredRPM,AppliedPWM
         Serial.print("SetpointRPM:");
         Serial.print(RPM_setpoint);
-        Serial.print(","); // Comma separator for plotter
-        Serial.print("MeasuredRPM:");
-        Serial.print(measuredRPM);
-        Serial.print(",");
-        Serial.print("PWM:"); // Also plot PWM now
-        Serial.println(currentPWM);
+        //Serial.print(",");
+        //Serial.print("RawRPM:"); // Add Raw RPM label
+        //Serial.print(rawRPM_display,6); // Print the raw value
+        //Serial.print(",");
+        Serial.print("FilteredRPM:"); // Add Filtered RPM label
+        
+        Serial.println(g_filteredRPM,6); // <<< Print the global filtered value
+        //Serial.print(",");
+        //Serial.print("PWM:"); // Also plot PWM now
+        //Serial.println(currentPWM); // currentPWM is updated in setMotorPWM
     }
 }
-
 
 // =========================================================================
 // SETUP FUNCTION (Keep mostly as is)
@@ -363,27 +402,34 @@ void loop() {
         }
     }
 
+ // Get the latest raw RPM calculated by the timer callback
+    float rawRPM;
+    noInterrupts();
+    rawRPM = currentRPM;
+    interrupts();
+
+    // Update the global filtered RPM value using the EMA function
+    g_filteredRPM = updateEMA(rawRPM);
+    // +++ END OF STEP 1 +++
+
 
     // --- PID Control Loop (Runs periodically) ---
     unsigned long currentMillis = millis();
-    if (currentMillis - lastPIDRunTime >= PID_INTERVAL_MS) {
+    if (currentMillis - lastPIDRunTime >= PID_INTERVAL_MS) 
+    {
         lastPIDRunTime = currentMillis; // Update time of this PID run
-
-        // Get current speed measurement
-        float measuredRPM;
-        noInterrupts();
-        measuredRPM = currentRPM;
-        interrupts();
 
         // --- NEW PID FLOW ---
         // 1. Reset integral if setpoint is zero (helps prevent windup at stop)
-        if (abs(RPM_setpoint) < 0.1) {
-             integral = 0.0;
-             previousErrorRPM = 0.0; // Reset previous error as well
+        if (abs(RPM_setpoint) < 0.1) 
+        {
+            integral = 0.0;
+            previousErrorRPM = 0.0; // Reset previous error as well
         }
 
         // 2. Calculate desired control effort in RPM units using PID
-        float targetEffort_RPM = calculatePID_RPM_Output(RPM_setpoint, measuredRPM);
+        //    +++ STEP 2: Use g_filteredRPM as PID input +++
+        float targetEffort_RPM = calculatePID_RPM_Output(RPM_setpoint, g_filteredRPM); // <<< Use g_filteredRPM here
 
         // 3. Transform the RPM-based effort into a PWM value
         int targetPWM = transformRPMtoPWM(targetEffort_RPM);
@@ -391,11 +437,11 @@ void loop() {
         // 4. Apply the calculated PWM to the motor
         setMotorPWM(targetPWM);
         // --- End of NEW PID FLOW ---
-    }
+    } // --- End of PID Control Loop ---
 
     // --- Servo Control --- (Keep as is)
     control_servo();
 
-    // --- Display Data --- (Keep as is - now plots PWM too)
+    // --- Display Data --- (Keep as is - Will modify this function in Step 3)
     displayData();
 }
